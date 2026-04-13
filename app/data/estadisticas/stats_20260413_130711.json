@@ -1,0 +1,123 @@
+{
+  "summary": {
+    "session": {
+      "start_time": "2026-04-13T13:06:11.173072",
+      "duration_seconds": 60.067952,
+      "frames_processed": 66
+    },
+    "current": {
+      "total_people": 1,
+      "identified": 1,
+      "unknown": 0,
+      "zones": {}
+    },
+    "unique": {
+      "total_unique_tracks": 1,
+      "unique_identified_people": 1,
+      "identified_names": [
+        "Jorge Mateo Gutierrez Morales"
+      ],
+      "unique_unknown": 0
+    },
+    "peak": {
+      "max_people_at_once": 1,
+      "peak_time": "2026-04-13T13:07:06.033250"
+    }
+  },
+  "history": [
+    {
+      "timestamp": "2026-04-13T13:07:09.123455",
+      "total": 1,
+      "identified": 1,
+      "unknown": 0,
+      "zones": {}
+    },
+    {
+      "timestamp": "2026-04-13T13:07:10.864836",
+      "total": 1,
+      "identified": 1,
+      "unknown": 0,
+      "zones": {}
+    }
+  ],
+  "people_log": [
+    {
+      "timestamp": "2026-04-13T13:07:06.265166",
+      "track_id": 1,
+      "identity": "Jorge Mateo Gutierrez Morales",
+      "confidence": 0.85011218988994
+    },
+    {
+      "timestamp": "2026-04-13T13:07:06.532133",
+      "track_id": 1,
+      "identity": "Jorge Mateo Gutierrez Morales",
+      "confidence": 0.8471723885486054
+    },
+    {
+      "timestamp": "2026-04-13T13:07:06.802585",
+      "track_id": 1,
+      "identity": "Jorge Mateo Gutierrez Morales",
+      "confidence": 0.8576582426050743
+    },
+    {
+      "timestamp": "2026-04-13T13:07:07.299892",
+      "track_id": 1,
+      "identity": "Jorge Mateo Gutierrez Morales",
+      "confidence": 0.8952302431279099
+    },
+    {
+      "timestamp": "2026-04-13T13:07:07.571240",
+      "track_id": 1,
+      "identity": "Jorge Mateo Gutierrez Morales",
+      "confidence": 0.8858103067709677
+    },
+    {
+      "timestamp": "2026-04-13T13:07:09.233789",
+      "track_id": 1,
+      "identity": "Jorge Mateo Gutierrez Morales",
+      "confidence": 0.8744444878017705
+    },
+    {
+      "timestamp": "2026-04-13T13:07:09.526499",
+      "track_id": 1,
+      "identity": "Jorge Mateo Gutierrez Morales",
+      "confidence": 0.8809288875946011
+    },
+    {
+      "timestamp": "2026-04-13T13:07:09.834713",
+      "track_id": 1,
+      "identity": "Jorge Mateo Gutierrez Morales",
+      "confidence": 0.9054175473713985
+    },
+    {
+      "timestamp": "2026-04-13T13:07:10.118328",
+      "track_id": 1,
+      "identity": "Jorge Mateo Gutierrez Morales",
+      "confidence": 0.8954947226671314
+    },
+    {
+      "timestamp": "2026-04-13T13:07:10.424945",
+      "track_id": 1,
+      "identity": "Jorge Mateo Gutierrez Morales",
+      "confidence": 0.8955043334945301
+    },
+    {
+      "timestamp": "2026-04-13T13:07:10.673576",
+      "track_id": 1,
+      "identity": "Jorge Mateo Gutierrez Morales",
+      "confidence": 0.8841233566900057
+    },
+    {
+      "timestamp": "2026-04-13T13:07:10.960296",
+      "track_id": 1,
+      "identity": "Jorge Mateo Gutierrez Morales",
+      "confidence": 0.9222385325677498
+    },
+    {
+      "timestamp": "2026-04-13T13:07:11.241024",
+      "track_id": 1,
+      "identity": "Jorge Mateo Gutierrez Morales",
+      "confidence": 0.7827675306940249
+    }
+  ]
+}
