@@ -3,7 +3,8 @@ reid-env/
 venv/
 .env/
 *.env
-
+data/
+*.txt
 # Archivos temporales y cachés
 __pycache__/
 *.pyc

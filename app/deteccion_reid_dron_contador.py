@@ -4,7 +4,7 @@ from ultralytics import YOLO
 import torch
 import pickle
 import numpy as np
-from torchreid.utils import FeatureExtractor
+from feature_extractors import build_extractor, get_base_path, get_model_name
 from sklearn.metrics.pairwise import cosine_similarity
 import time
 from collections import defaultdict, deque
@@ -612,17 +612,13 @@ def main():
     print(f"✅ YOLO en {device}")
 
     # Cargar extractor
-    print("\n🧠 Cargando OSNet...")
-    extractor = FeatureExtractor(
-        model_name='osnet_x1_0',
-        model_path=os.path.join(DATA_DIR, 'osnet_x1_0_imagenet.pth'),
-        device=device
-    )
+    print(f"\n🧠 Cargando OSNet... ({get_model_name()})")
+    extractor = build_extractor(device=device)
     print("✅ Extractor cargado")
 
     # Cargar base
     print(f"\n📚 Cargando base de datos...")
-    with open(BASE_EMBEDDINGS, "rb") as f:
+    with open(get_base_path(), "rb") as f:
         base = pickle.load(f)
     print(f"✅ Base: {len(base)} persona(s)")
 

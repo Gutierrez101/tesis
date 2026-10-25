@@ -16,7 +16,7 @@ import cv2
 import torch
 import pickle
 import numpy as np
-from torchreid.utils import FeatureExtractor
+from feature_extractors import build_extractor, get_base_path, get_model_name
 from scipy.spatial.distance import cdist, mahalanobis
 from scipy import stats
 from sklearn.metrics import confusion_matrix, classification_report
@@ -570,15 +570,11 @@ def main():
     print(f"  Normalización L2: {'✅' if NORMALIZE_EMBEDDINGS else '❌'}")
 
     # Cargar extractor
-    print("\n📦 Cargando modelo OSNet...")
+    print(f"\n📦 Cargando modelo {get_model_name()}...")
     device = 'cuda' if torch.cuda.is_available() else 'cpu'
     print(f"   Usando: {device.upper()}")
 
-    extractor = FeatureExtractor(
-        model_name='osnet_x1_0',
-        model_path=MODEL_PATH,
-        device=device
-    )
+    extractor = build_extractor(device=device)
 
     print("✅ Modelo cargado")
 
@@ -627,14 +623,14 @@ def main():
 
     # Guardar base de datos
     if base_embeddings:
-        with open(BASE_EMBEDDINGS, 'wb') as f:
+        with open(get_base_path(), 'wb') as f:
             pickle.dump(base_embeddings, f)
 
         print("\n" + "="*70)
         print("📊 RESUMEN GENERAL")
         print("="*70)
         print(f"✅ Personas procesadas: {len(base_embeddings)}")
-        print(f"📁 Base guardada en: {BASE_EMBEDDINGS}")
+        print(f"📁 Base guardada en: {get_base_path()}")
 
         # Estadísticas generales
         avg_quality_all = np.mean([s["avg_quality"] for s in statistics])
