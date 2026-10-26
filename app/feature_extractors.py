@@ -18,14 +18,14 @@ from config import DATA_DIR, BASE_EMBEDDINGS, MODEL_PATH
 
 DEFAULT_MODEL = 'osnet_x1_0'
 
-# alias -> nombre del modelo en timm (pesos ImageNet se descargan solos)
+
 TIMM_MODELS = {
     'repvit':            'repvit_m1_0',
     'efficientformerv2': 'efficientformerv2_s0',
     'fastvit':           'fastvit_t8',
     'swiftformer':       'swiftformer_xs',
 }
-# Se aceptan también los nombres completos de timm (p. ej. fastvit_t12)
+# Se aceptan también los nombres completos de timm
 _PREFIXES = ('repvit', 'efficientformerv2', 'fastvit', 'swiftformer')
 
 
