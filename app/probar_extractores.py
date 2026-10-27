@@ -1,3 +1,8 @@
+"""
+Prueba rápida de los extractores (ejecutar ANTES de regenerar bases).
+    python probar_extractores.py              -> prueba los 4 modelos nuevos
+    python probar_extractores.py repvit       -> prueba uno solo
+"""
 import sys
 import time
 import numpy as np

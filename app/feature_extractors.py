@@ -18,15 +18,40 @@ from config import DATA_DIR, BASE_EMBEDDINGS, MODEL_PATH
 
 DEFAULT_MODEL = 'osnet_x1_0'
 
-
+# alias -> nombre del modelo en timm (pesos ImageNet se descargan solos)
 TIMM_MODELS = {
     'repvit':            'repvit_m1_0',
     'efficientformerv2': 'efficientformerv2_s0',
     'fastvit':           'fastvit_t8',
     'swiftformer':       'swiftformer_xs',
 }
-# Se aceptan también los nombres completos de timm
+# Se aceptan también los nombres completos de timm (p. ej. fastvit_t12)
 _PREFIXES = ('repvit', 'efficientformerv2', 'fastvit', 'swiftformer')
+
+
+# Todos los modelos soportados (OSNet + los 4 nuevos)
+ALL_MODELS = ['osnet_x1_0', 'repvit', 'efficientformerv2', 'fastvit', 'swiftformer']
+
+
+def get_results_dir(model_name=None):
+    """OSNet guarda sus resultados donde siempre (data/). Los demás modelos
+    usan data/resultados/<modelo>/ para que no se sobrescriban entre sí."""
+    name = model_name or get_model_name()
+    if not _is_timm(name):
+        return DATA_DIR
+    path = os.path.join(DATA_DIR, 'resultados', name)
+    os.makedirs(path, exist_ok=True)
+    return path
+
+
+def get_threshold(model_name=None):
+    from config import IDENTIFICATION_THRESHOLDS, DEFAULT_THRESHOLD
+    return IDENTIFICATION_THRESHOLDS.get(model_name or get_model_name(), DEFAULT_THRESHOLD)
+
+
+def list_available_models():
+    """Modelos cuya base .pkl ya fue generada."""
+    return [m for m in ALL_MODELS if os.path.exists(get_base_path(m))]
 
 
 def get_model_name():

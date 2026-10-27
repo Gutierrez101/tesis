@@ -16,7 +16,8 @@ import cv2
 import torch
 import pickle
 import numpy as np
-from feature_extractors import build_extractor, get_base_path, get_model_name
+from feature_extractors import (build_extractor, get_base_path, get_model_name,
+                                get_results_dir, get_threshold)
 from scipy.spatial.distance import cdist, mahalanobis
 from scipy import stats
 from sklearn.metrics import confusion_matrix, classification_report
@@ -428,7 +429,7 @@ def evaluar_modelo(base_embeddings, personas_base_dir, extractor, threshold=0.70
     print(f"   Confianza promedio: {np.mean(confidencias)*100:.2f}%")
 
     # Guardar resultados en CSV
-    results_path = os.path.join(DATA_DIR, "matriz_confusion_resultados.csv")
+    results_path = os.path.join(get_results_dir(), "matriz_confusion_resultados.csv")
     with open(results_path, 'w') as f:
         f.write("Etiqueta Real,Prediccion,Confianza,Correcto\n")
         for real, pred, conf in zip(etiquetas_reales, predicciones, confidencias):
@@ -479,7 +480,7 @@ def evaluar_modelo(base_embeddings, personas_base_dir, extractor, threshold=0.70
     plt.tight_layout()
 
     # Guardar imagen
-    img_path = os.path.join(DATA_DIR, "matriz_confusion_visual.png")
+    img_path = os.path.join(get_results_dir(), "matriz_confusion_visual.png")
     plt.savefig(img_path, dpi=150, bbox_inches='tight', facecolor='white')
     print(f"📊 Imagen guardada en: {img_path}")
 
@@ -546,7 +547,7 @@ def evaluar_modelo(base_embeddings, personas_base_dir, extractor, threshold=0.70
     plt.tight_layout()
 
     # Guardar segunda imagen
-    img_path2 = os.path.join(DATA_DIR, "metricas_por_persona.png")
+    img_path2 = os.path.join(get_results_dir(), "metricas_por_persona.png")
     plt.savefig(img_path2, dpi=150, bbox_inches='tight', facecolor='white')
     print(f"📈 Métricas guardadas en: {img_path2}")
 
@@ -678,7 +679,8 @@ def main():
             print(f"   ✨ ¡Excelente! Todas las personas tienen buena calidad")
 
         # Evaluar modelo con matriz de confusión
-        evaluar_modelo(base_embeddings, PERSONAS_BASE, extractor, threshold=0.70)
+        cm, accuracy = evaluar_modelo(base_embeddings, PERSONAS_BASE, extractor,
+                                      threshold=get_threshold())
 
         print("\n" + "="*70)
         print("✅ PROCESO COMPLETADO")
@@ -686,8 +688,21 @@ def main():
         print("\n💡 Siguiente paso:")
         print("   python deteccion_reid_dron_contador.py")
 
+        return {
+            "modelo": get_model_name(),
+            "base_path": get_base_path(),
+            "dim": int(len(base_embeddings[0]["embedding"])),
+            "personas": len(base_embeddings),
+            "imagenes": int(total_images),
+            "calidad_prom": float(avg_quality_all),
+            "consistencia_prom": float(avg_consistency_all),
+            "umbral": get_threshold(),
+            "accuracy": float(accuracy),
+        }
+
     else:
         print("\n❌ No se pudo procesar ninguna persona")
+        return None
 
 if __name__ == "__main__":
     main()

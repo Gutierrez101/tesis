@@ -9,6 +9,16 @@ PERSONAS_BASE = os.path.join(DATA_DIR, 'personas_base')
 BASE_EMBEDDINGS = os.path.join(DATA_DIR, 'base_personas.pkl')
 MODEL_PATH = os.path.join(DATA_DIR, 'osnet_x1_0_imagenet.pth')
 
+# Umbral de identificación POR MODELO (ajústalo con la matriz de confusión de cada uno)
+IDENTIFICATION_THRESHOLDS = {
+    'osnet_x1_0':        0.70,
+    'repvit':            0.70,
+    'efficientformerv2': 0.70,
+    'fastvit':           0.70,
+    'swiftformer':       0.70,
+}
+DEFAULT_THRESHOLD = 0.70
+
 # Ruta para visualizaciones
 VISUALIZATIONS_DIR = os.path.join(DATA_DIR, 'visualizaciones')
 

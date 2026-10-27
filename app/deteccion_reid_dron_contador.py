@@ -4,7 +4,8 @@ from ultralytics import YOLO
 import torch
 import pickle
 import numpy as np
-from feature_extractors import build_extractor, get_base_path, get_model_name
+from feature_extractors import build_extractor, get_base_path, get_model_name, get_threshold
+from model_comparison import MultiModelEvaluator
 from sklearn.metrics.pairwise import cosine_similarity
 import time
 from collections import defaultdict, deque
@@ -53,6 +54,11 @@ MIN_CONFIDENCE = 0.4
 # Parámetros de Re-identificación
 IDENTIFICATION_THRESHOLD = 0.70
 REID_UPDATE_INTERVAL = 5
+
+# Comparación en vivo de todos los modelos que tengan base .pkl generada.
+# Actívala con la variable de entorno REID_COMPARE=1 (o pon True aquí).
+# Por defecto está apagada: el sistema funciona exactamente como antes.
+ENABLE_MODEL_COMPARISON = os.environ.get('REID_COMPARE', '0') == '1'
 
 # Parámetros de Tracking
 TRACK_PERSISTENCE_FRAMES = 15
@@ -612,7 +618,7 @@ def main():
     print(f"✅ YOLO en {device}")
 
     # Cargar extractor
-    print(f"\n🧠 Cargando OSNet... ({get_model_name()})")
+    print(f"\n🧠 Cargando extractor ({get_model_name()})...")
     extractor = build_extractor(device=device)
     print("✅ Extractor cargado")
 
@@ -621,6 +627,15 @@ def main():
     with open(get_base_path(), "rb") as f:
         base = pickle.load(f)
     print(f"✅ Base: {len(base)} persona(s)")
+    umbral_principal = get_threshold()   # umbral del modelo principal (config.py)
+
+    # Comparador de modelos (opcional)
+    comparador = None
+    show_cmp_panel = True
+    if ENABLE_MODEL_COMPARISON:
+        comparador = MultiModelEvaluator(
+            primary_name=get_model_name(), primary_base=base,
+            device=device, output_dir=STATS_OUTPUT_DIR)
 
     # Inicializar contador
     counter = PeopleCounter()
@@ -714,6 +729,8 @@ def main():
     print("   - 'q': Salir (guarda estadísticas)")
     print("   - 's': Guardar estadísticas ahora")
     print("   - 'r': Reset contadores")
+    if ENABLE_MODEL_COMPARISON:
+        print("   - 'm': Mostrar/ocultar panel de comparación de modelos")
     print("   - 'v': Ver estadísticas de visualizaciones" if ENABLE_VISUALIZATIONS else "")
     print()
 
@@ -846,9 +863,16 @@ def main():
                         if crop is not None and crop.size > 0 and len(crop.shape) == 3:
                             try:
                                 crop_resized = cv2.resize(crop, (128, 256))
+                                t_reid = time.perf_counter()
                                 emb = extractor(crop_resized)[0]
-                                identity, confidence = identificar(emb, base)
+                                identity, confidence = identificar(emb, base, threshold=umbral_principal)
+                                ms_reid = (time.perf_counter() - t_reid) * 1000
                                 track.update_identity(identity, confidence, frame_count)
+
+                                # Mismo recorte a los demás modelos (solo si está activado)
+                                if comparador:
+                                    comparador.evaluate(track.track_id, crop_resized, frame_count,
+                                                        (identity, confidence, ms_reid))
 
                                 # Log detección
                                 counter.log_detection(
@@ -905,6 +929,8 @@ def main():
 
         # Panel de conteo
         draw_counting_panel(original_frame, counter, fps)
+        if comparador and show_cmp_panel:
+            comparador.draw_panel(original_frame)
 
         cv2.imshow("ReID + Contador", original_frame)
 
@@ -917,9 +943,15 @@ def main():
         elif key == ord('s'):
             print("\n💾 Guardando estadísticas...")
             counter.save_stats(EXPORT_FORMAT)
+            if comparador:
+                comparador.save()
         elif key == ord('r'):
             print("\n🔄 Reseteando contadores...")
             counter = PeopleCounter()
+            if comparador:
+                comparador.reset()
+        elif key == ord('m') and comparador:
+            show_cmp_panel = not show_cmp_panel
         elif key == ord('v') and viz_handler:
             # Mostrar estadísticas de visualizaciones
             viz_stats = viz_handler.get_stats()
@@ -954,6 +986,9 @@ def main():
     if stats['unique']['identified_names']:
         print(f"📝 Nombres identificados: {', '.join(stats['unique']['identified_names'])}")
     print(f"🔄 Reconexiones de stream: {total_reconnections}")
+    if comparador:
+        comparador.print_table()
+        comparador.save()
 
     # Resumen de visualizaciones
     if viz_handler and viz_stats['total_processed'] > 0:
