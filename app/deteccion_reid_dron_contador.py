@@ -662,7 +662,10 @@ def main():
 
     # Conectar stream con configuración robusta
     print("\n🎥 Conectando a stream RTMP...")
-    rtmp_url = "rtmp://localhost:1935/live/stream"
+    rtmp_url = os.getenv(
+        "RTMP_URL",
+        "rtmp://127.0.0.1/1935/live/stream"
+    )
 
     def connect_to_stream(url, max_retries=STREAM_RECONNECT_ATTEMPTS):
         """Conecta al stream RTMP con parámetros optimizados para manejar pérdida de paquetes"""

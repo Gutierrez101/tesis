@@ -6,7 +6,7 @@ services:
     build: ./rtmp-server
     ports:
       - "1935:1935"  # RTMP
-      - "8080:80"    # Interfaz web
+      - "127.0.0.1:8080:80"    # Interfaz web
     restart: unless-stopped
     networks:
       - app-network
