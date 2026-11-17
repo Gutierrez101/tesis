@@ -4,6 +4,7 @@ venv/
 .env/
 *.env
 data/
+*matriz_confusion_resultados.csv
 *.txt
 # Archivos temporales y cachés
 __pycache__/
@@ -70,3 +71,5 @@ personas_base/
 *.tar
 *.7z
 *.rar
+app/data/matriz_confusion_resultados.csv
+app/data/matriz_confusion_resultados.csv

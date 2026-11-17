@@ -60,6 +60,21 @@ REID_UPDATE_INTERVAL = 5
 # Por defecto está apagada: el sistema funciona exactamente como antes.
 ENABLE_MODEL_COMPARISON = os.environ.get('REID_COMPARE', '0') == '1'
 
+# Pruebas en tiempo real (pruebas/monitor_tiempo_real.py): off | eficiencia | completo
+# Se configura en pruebas/config_pruebas.py (o con PRUEBAS_MODO). Por defecto 'off': el sistema funciona como antes.
+_APP_DIR = os.path.dirname(os.path.abspath(__file__))
+# La carpeta de pruebas puede llamarse 'pruebas' o 'tests': se detecta sola
+PRUEBAS_PKG = next((p for p in ('pruebas', 'tests')
+                    if os.path.isfile(os.path.join(_APP_DIR, p, 'monitor_tiempo_real.py'))), 'pruebas')
+PRUEBAS_MODO = os.environ.get('PRUEBAS_MODO', '').strip().lower()
+if not PRUEBAS_MODO:                      # sin variable de entorno: se lee <carpeta>/config_pruebas.py
+    try:
+        import importlib
+        PRUEBAS_MODO = str(importlib.import_module(f'{PRUEBAS_PKG}.config_pruebas').MODO).strip().lower()
+    except Exception:
+        PRUEBAS_MODO = 'off'
+ENABLE_PRUEBAS = PRUEBAS_MODO in ('eficiencia', 'completo')
+
 # Parámetros de Tracking
 TRACK_PERSISTENCE_FRAMES = 15
 IOU_THRESHOLD = 0.3
@@ -629,10 +644,19 @@ def main():
     print(f"✅ Base: {len(base)} persona(s)")
     umbral_principal = get_threshold()   # umbral del modelo principal (config.py)
 
+    # Monitor de pruebas en tiempo real (opcional, PRUEBAS_MODO=eficiencia|completo)
+    monitor = None
+    if ENABLE_PRUEBAS:
+        import importlib
+        MonitorPruebas = importlib.import_module(f'{PRUEBAS_PKG}.monitor_tiempo_real').MonitorPruebas
+        monitor = MonitorPruebas(modo=PRUEBAS_MODO, primary_name=get_model_name(), primary_base=base,
+                                 device=device, window='ReID + Contador')
+        cv2.setMouseCallback('ReID + Contador', monitor.on_mouse)
+
     # Comparador de modelos (opcional)
     comparador = None
     show_cmp_panel = True
-    if ENABLE_MODEL_COMPARISON:
+    if ENABLE_MODEL_COMPARISON and not ENABLE_PRUEBAS:
         comparador = MultiModelEvaluator(
             primary_name=get_model_name(), primary_base=base,
             device=device, output_dir=STATS_OUTPUT_DIR)
@@ -750,7 +774,11 @@ def main():
     total_reconnections = 0
 
     while True:
+        if monitor:
+            monitor.iter_inicio()
         ret, frame = cap.read()
+        if monitor:
+            monitor.lectura(ret and frame is not None)
 
         # Manejo de errores de lectura con reconexión
         if not ret or frame is None:
@@ -760,6 +788,8 @@ def main():
             if consecutive_read_failures >= MAX_CONSECUTIVE_FRAME_FAILURES:
                 logger.warning(f"{consecutive_read_failures} frames fallidos consecutivos. Iniciando reconexión...")
                 total_reconnections += 1
+                if monitor:
+                    monitor.on_reconexion()
 
                 cap.release()
                 cap = connect_to_stream(rtmp_url)
@@ -792,6 +822,8 @@ def main():
 
         # Procesamiento
         original_frame = frame.copy()
+        if monitor:
+            monitor.on_frame(original_frame)
 
         if SCALE_PERCENT != 100:
             width = int(frame.shape[1] * SCALE_PERCENT / 100)
@@ -806,6 +838,7 @@ def main():
 
         if process_this_frame:
             try:
+                _t_det = time.perf_counter()
                 results = model(frame_small, verbose=False, imgsz=640)
                 detections = []
                 detection_crops = []
@@ -831,7 +864,13 @@ def main():
                 logger.error(f"Error en detección YOLO: {e}")
                 detections = []
                 detection_crops = []
+                if monitor:
+                    monitor.on_error('deteccion')
 
+            if monitor:
+                monitor.etapa('deteccion', (time.perf_counter() - _t_det) * 1000 if '_t_det' in locals() else 0.0)
+                monitor.on_detecciones(detections, original_frame.shape)
+            _t_trk = time.perf_counter()
             matched, unmatched_dets, unmatched_tracks = match_detections_to_tracks(
                 detections, tracks
             )
@@ -845,6 +884,8 @@ def main():
 
             for track_idx in unmatched_tracks:
                 tracks[track_idx].increment_age()
+            if monitor:
+                monitor.etapa('tracking', (time.perf_counter() - _t_trk) * 1000)
 
             # Re-ID
             for i, track in enumerate(tracks):
@@ -877,6 +918,10 @@ def main():
                                     comparador.evaluate(track.track_id, crop_resized, frame_count,
                                                         (identity, confidence, ms_reid))
 
+                                # Pruebas en tiempo real (solo si PRUEBAS_MODO está activo)
+                                if monitor:
+                                    monitor.on_reid(track, crop_resized, emb, identity, confidence, ms_reid, frame_count)
+
                                 # Log detección
                                 counter.log_detection(
                                     track.track_id,
@@ -897,9 +942,12 @@ def main():
 
                             except Exception as e:
                                 # Error en Re-ID, continuar sin crash
-                                pass
+                                if monitor:
+                                    monitor.on_error('reid')
 
             tracks = [t for t in tracks if t.is_alive()]
+            if monitor:
+                monitor.on_tracks(tracks, frame_count)
 
         # Actualizar contadores
         counter.update(tracks)
@@ -934,8 +982,12 @@ def main():
         draw_counting_panel(original_frame, counter, fps)
         if comparador and show_cmp_panel:
             comparador.draw_panel(original_frame)
+        if monitor:
+            monitor.dibujar(original_frame, tracks)
 
         cv2.imshow("ReID + Contador", original_frame)
+        if monitor:
+            monitor.fin_iteracion()
 
         # Controles
         key = cv2.waitKey(1) & 0xFF
@@ -948,6 +1000,8 @@ def main():
             counter.save_stats(EXPORT_FORMAT)
             if comparador:
                 comparador.save()
+            if monitor:
+                monitor.guardar()
         elif key == ord('r'):
             print("\n🔄 Reseteando contadores...")
             counter = PeopleCounter()
@@ -968,6 +1022,9 @@ def main():
             for person, count in viz_stats['saves_per_person'].items():
                 print(f"   - {person}: {count}")
             print("="*70)
+
+        elif monitor and monitor.on_key(key):
+            pass
 
     # Detener sistema de visualizaciones
     if viz_handler:
@@ -992,6 +1049,8 @@ def main():
     if comparador:
         comparador.print_table()
         comparador.save()
+    if monitor:
+        monitor.finalizar(total_reconnections)
 
     # Resumen de visualizaciones
     if viz_handler and viz_stats['total_processed'] > 0:
