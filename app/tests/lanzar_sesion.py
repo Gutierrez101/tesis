@@ -9,6 +9,9 @@ Ejemplos (desde app/):
     python pruebas/lanzar_sesion.py --modo eficiencia --sesion vuelo_eficiencia --altura 15
     python pruebas/lanzar_sesion.py --modo completo --sesion vuelo_20m --altura 20 --angulo cenital_parcial --grabar
     python pruebas/lanzar_sesion.py --consolidar          # junta TODAS las sesiones guardadas en un solo análisis
+    python pruebas/lanzar_sesion.py --analizar            # re-analiza la última sesión
+    python pruebas/lanzar_sesion.py --video data/pruebas_tiempo_real/<sesion>/video_origen.mp4 --etiquetas tiempos.csv --fps-video 25
+                                                          # REPITE un vuelo grabado (sin dron ni nginx) con etiquetas automáticas
 
 Equivale a (PowerShell):
     $env:PRUEBAS_MODO="completo"; $env:PRUEBAS_ALTURA_M="20"; python deteccion_reid_dron_contador.py
@@ -74,32 +77,42 @@ def verificar(args, modo):
         ok(f'GPU: {out.splitlines()[0]}') if out else aviso('nvidia-smi no devolvió GPU (se usará CPU)')
     except Exception:
         aviso('nvidia-smi no disponible: las pruebas de eficiencia correrán en CPU y NO serán representativas')
-    # nginx
-    host = args.host
-    if puerto_abierto(host, 1935):
-        ok(f'Servidor RTMP responde en {host}:1935')
+    if getattr(args, 'video', None):
+        if os.path.exists(args.video):
+            ok(f'Repetición del vuelo grabado: {args.video} (no se necesita nginx ni dron)')
+        else:
+            mal(f'No existe el video: {args.video}')
+            problemas += 1
+        if getattr(args, 'etiquetas', None):
+            (ok if os.path.exists(args.etiquetas) else mal)(f'CSV de etiquetas: {args.etiquetas}')
+            problemas += 0 if os.path.exists(args.etiquetas) else 1
     else:
-        mal(f'Nada escucha en {host}:1935. Levanta el contenedor:  docker compose up -d --build rtmp')
-        problemas += 1
-    acc, pub, _ = stream_activo(f'http://{host}:8080/stat')
-    if not acc:
-        aviso(f'No se pudo leer http://{host}:8080/stat (¿contenedor sin el puerto 8080:80?)')
-    elif pub:
-        ok('Hay un publicador transmitiendo (el dron / OBS está enviando video)')
-    else:
-        aviso('El servidor está arriba pero NADIE transmite todavía: inicia la transmisión del dron a '
-              f'rtmp://IP_DE_ESTA_PC:1935/live/stream')
-        if args.esperar_stream:
-            print(f'     esperando hasta {args.esperar_stream}s a que llegue el stream...')
-            t0 = time.time()
-            while time.time() - t0 < args.esperar_stream:
-                if stream_activo(f'http://{host}:8080/stat')[1]:
-                    ok('Stream detectado')
-                    break
-                time.sleep(2)
-            else:
-                mal('No llegó el stream a tiempo')
-                problemas += 1
+        # nginx
+        host = args.host
+        if puerto_abierto(host, 1935):
+            ok(f'Servidor RTMP responde en {host}:1935')
+        else:
+            mal(f'Nada escucha en {host}:1935. Levanta el contenedor:  docker compose up -d --build rtmp')
+            problemas += 1
+        acc, pub, _ = stream_activo(f'http://{host}:8080/stat')
+        if not acc:
+            aviso(f'No se pudo leer http://{host}:8080/stat (¿contenedor sin el puerto 8080:80?)')
+        elif pub:
+            ok('Hay un publicador transmitiendo (el dron / OBS está enviando video)')
+        else:
+            aviso('El servidor está arriba pero NADIE transmite todavía: inicia la transmisión del dron a '
+                  f'rtmp://IP_DE_ESTA_PC:1935/live/stream')
+            if args.esperar_stream:
+                print(f'     esperando hasta {args.esperar_stream}s a que llegue el stream...')
+                t0 = time.time()
+                while time.time() - t0 < args.esperar_stream:
+                    if stream_activo(f'http://{host}:8080/stat')[1]:
+                        ok('Stream detectado')
+                        break
+                    time.sleep(2)
+                else:
+                    mal('No llegó el stream a tiempo')
+                    problemas += 1
     # bases
     try:
         from feature_extractors import ALL_MODELS, get_base_path
@@ -147,6 +160,30 @@ def consolidar():
     analizar_sesiones(dirs, os.path.join(base, 'consolidado'))
 
 
+def _base_sesiones():
+    try:
+        from config import DATA_DIR
+    except Exception:
+        DATA_DIR = os.path.join(APP_DIR, 'data')
+    return os.path.join(DATA_DIR, 'pruebas_tiempo_real')
+
+
+def analizar(carpeta):
+    """Analiza (o re-analiza) una sesión. 'ultima' = la más reciente."""
+    base = _base_sesiones()
+    if carpeta in (None, '', 'ultima'):
+        cand = sorted(d for d in os.listdir(base) if os.path.exists(os.path.join(base, d, 'sistema.json'))) if os.path.isdir(base) else []
+        if not cand:
+            print(f'❌ No hay sesiones en {base}')
+            return
+        carpeta = os.path.join(base, cand[-1])
+    elif not os.path.isdir(carpeta):
+        carpeta = os.path.join(base, carpeta)
+    print(f'📊 Analizando: {carpeta}')
+    from analisis_vuelo import analizar_sesiones
+    analizar_sesiones([carpeta], os.path.join(carpeta, 'analisis'))
+
+
 def main():
     ap = argparse.ArgumentParser(description='Lanza una sesión de pruebas con el dron')
     ap.add_argument('--modo', default='completo', choices=['eficiencia', 'completo'])
@@ -162,10 +199,17 @@ def main():
     ap.add_argument('--esperar-stream', type=int, default=0, help='segundos a esperar a que el dron empiece a transmitir')
     ap.add_argument('--solo-verificar', action='store_true')
     ap.add_argument('--consolidar', action='store_true')
+    ap.add_argument('--analizar', nargs='?', const='ultima', default=None, metavar='CARPETA',
+                    help='re-analiza una sesión guardada (sin argumento: la última)')
+    ap.add_argument('--video', default=None, help='REPETIR un vuelo grabado (video_origen.mp4) en vez de usar el dron')
+    ap.add_argument('--etiquetas', default=None, help='CSV  desde_s,hasta_s,persona  para etiquetar solo al repetir el video')
+    ap.add_argument('--fps-video', type=float, default=None, help='FPS del video repetido (para convertir segundos a frames)')
     ap.add_argument('--forzar', action='store_true', help='lanza aunque la verificación detecte problemas')
     a = ap.parse_args()
     if a.consolidar:
         return consolidar()
+    if a.analizar is not None:
+        return analizar(a.analizar)
     problemas = verificar(a, a.modo)
     if a.solo_verificar:
         print('\n' + ('✅ Todo listo' if not problemas else f'❌ {problemas} problema(s) por resolver'))
@@ -173,9 +217,17 @@ def main():
     if problemas and not a.forzar:
         print(f'\n❌ {problemas} problema(s). Resuélvelos o usa --forzar.')
         sys.exit(1)
+    if a.video:
+        a.url = a.video
     env = dict(os.environ, PRUEBAS_MODO=a.modo, REID_MODEL=a.modelo, RTMP_URL=a.url, PRUEBAS_SESION=a.sesion,
                PRUEBAS_ALTURA_M=str(a.altura), PRUEBAS_ANGULO=a.angulo, PRUEBAS_FPS_STREAM=str(a.fps_stream),
                PRUEBAS_GRABAR='1' if a.grabar else '0')
+    if a.video:
+        env['PRUEBAS_FPS_STREAM'] = str(a.fps_video or a.fps_stream)
+        env['PRUEBAS_GRABAR'] = '0'
+        if a.etiquetas:
+            env['PRUEBAS_ETIQUETAS_CSV'] = os.path.abspath(a.etiquetas)
+            env['PRUEBAS_ETIQUETAS_BASE'] = 'frames'
     print('\n🚀 Lanzando deteccion_reid_dron_contador.py ...')
     print('   Teclas: clic=elegir persona | 1-9/0=asignar persona | u=desconocido | x=borrar | l=modo sesión | '
           '+/-=altura | a=ángulo | o=oclusión | g=grabar | t=panel | s=guardar | q=salir (guarda y analiza)\n')

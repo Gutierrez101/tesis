@@ -80,6 +80,21 @@ def cargar_sesion(d):
         with open(rs, encoding='utf-8') as fh:
             sistema = json.load(fh)
     sistema.setdefault('sesion', nombre)
+    tracks = []
+    rt = os.path.join(d, 'tracks.csv')
+    if os.path.exists(rt):
+        with open(rt, newline='', encoding='utf-8') as fh:
+            for r in csv.DictReader(fh):
+                tracks.append({'sesion': nombre, 'track': f"{nombre}:{r['track']}", 'primer': int(float(r['primer_frame'])),
+                               'ultimo': int(float(r['ultimo_frame'])), 'n': int(float(r['frames_vistos'])),
+                               'dur': _f(r['duracion_s'], 0.0), 'conf': r['confirmado'] == '1',
+                               'ident': r['identidad_final'], 'conf_id': _f(r['conf_final'], 0.0), 'gt': r['gt'] or None})
+    sistema['_tracks'] = tracks
+    rd = os.path.join(d, 'deteccion_eval.json')
+    if os.path.exists(rd):
+        with open(rd, encoding='utf-8') as fh:
+            sistema['deteccion_gt'] = json.load(fh)
+    sistema['_dir'] = d
     return list(eventos.values()), sistema
 
 
@@ -231,33 +246,148 @@ def tabla_imagen_video(eventos, variantes, primario):
     return filas
 
 
-def tabla_tracking(eventos, variantes, primario):
-    por_gt = defaultdict(set)
-    por_track_gt = defaultdict(set)
+VENTANA_REAPARICION_S = 5.0          # una identidad que reaparece en un track nuevo antes de este tiempo = fragmentación probable
+
+
+def _gaps_por_identidad(tracks, fps_ses, usar_gt):
+    """Pares de tracks consecutivos de la misma persona. Devuelve (pares, personas)."""
+    por = {}
+    for t in tracks:
+        if not t['conf']:
+            continue
+        clave = t['gt'] if (usar_gt and t['gt'] and t['gt'] != DESCONOCIDO) else (
+            t['ident'] if (not usar_gt and t['ident'] and t['ident'] != 'Desconocido') else None)
+        if clave:
+            por.setdefault((t['sesion'], clave), []).append(t)
+    pares = []
+    for (ses, persona), ts in por.items():
+        ts.sort(key=lambda t: t['primer'])
+        fps = fps_ses.get(ses, 30.0)
+        for a, b in zip(ts, ts[1:]):
+            gap = (b['primer'] - a['ultimo']) / fps
+            pares.append({'Sesión': ses, 'Persona': persona, 'Track A': a['track'].split(':')[-1], 'Track B': b['track'].split(':')[-1],
+                          'Hueco (s)': gap, 'Tipo': 'solapados (duplicado)' if gap < 0 else
+                          ('reaparición rápida' if gap <= VENTANA_REAPARICION_S else 'reaparición tardía')})
+    return pares, por
+
+
+def tabla_tracking(eventos, variantes, primario, sistemas=()):
+    tracks = [t for s in sistemas for t in (s.get('_tracks') or [])]
+    fps_ses = {s.get('sesion'): float(s.get('fps_nominal_usado') or 30.0) for s in sistemas}
+    ayuda_gt = 'Etiqueta personas (clic + número) o usa ETIQUETAS_CSV'
+    por_gt, por_track_gt = defaultdict(set), defaultdict(set)
     for e in eventos:
         if _conoc(e):
             por_gt[e['gt']].add(e['track'])
             por_track_gt[e['track']].add(e['gt'])
-    filas = [{'Concepto': 'Tracks con Re-ID', 'Valor': len({e['track'] for e in eventos})},
-             {'Concepto': 'Tracks etiquetados', 'Valor': len(por_track_gt)},
-             {'Concepto': 'Personas etiquetadas (enroladas)', 'Valor': len(por_gt)},
-             {'Concepto': 'ID switches por fragmentación (Σ tracks por persona − 1)',
-              'Valor': int(sum(max(len(t) - 1, 0) for t in por_gt.values()))},
-             {'Concepto': 'Tracks con 2+ personas distintas (mezcla de identidades)',
-              'Valor': int(sum(len(g) > 1 for g in por_track_gt.values()))}]
+    filas = []
+    if tracks:
+        conf = [t for t in tracks if t['conf']]
+        durs = np.array([t['dur'] for t in conf]) if conf else np.array([])
+        minutos = sum((s.get('duracion_s') or 0) for s in sistemas) / 60.0
+        filas += [{'Concepto': 'Tracks creados', 'Valor': len(tracks), 'Detalle': 'incluye los que nunca llegaron a confirmarse'},
+                  {'Concepto': 'Tracks confirmados', 'Valor': len(conf), 'Detalle': 'superaron el mínimo de frames del sistema'}]
+        if len(durs):
+            filas += [{'Concepto': 'Duración de un track confirmado (s), mediana', 'Valor': float(np.median(durs)),
+                       'Detalle': f'p10={np.percentile(durs, 10):.1f}s  p90={np.percentile(durs, 90):.1f}s'},
+                      {'Concepto': 'Tracks cortos (<1 s) (%)', 'Valor': 100 * float((durs < 1.0).mean()),
+                       'Detalle': 'valor alto = fragmentación o falsos positivos'}]
+        if minutos > 0:
+            filas.append({'Concepto': 'Tracks confirmados por minuto', 'Valor': len(conf) / minutos, 'Detalle': f'{minutos:.1f} min de sesión'})
+        simult = [s.get('detecciones') or {} for s in sistemas]
+        if simult:
+            filas.append({'Concepto': 'Personas simultáneas (media | máx)',
+                          'Valor': f"{np.mean([d.get('personas_por_frame_media', 0) for d in simult]):.2f} | {max(d.get('personas_max', 0) for d in simult)}",
+                          'Detalle': 'detecciones por frame'})
+        pares, _ = _gaps_por_identidad(tracks, fps_ses, usar_gt=False)
+        filas += [{'Concepto': f'Reapariciones de la misma identidad en un track nuevo (≤{VENTANA_REAPARICION_S:.0f} s)',
+                   'Valor': sum(p['Tipo'] == 'reaparición rápida' for p in pares),
+                   'Detalle': 'fragmentación probable, medida con la identidad del sistema (sin etiquetas)'},
+                  {'Concepto': 'Tracks simultáneos con la misma identidad (duplicados)',
+                   'Valor': sum(p['Tipo'].startswith('solapados') for p in pares), 'Detalle': 'dos tracks para una misma persona a la vez'},
+                  {'Concepto': 'Tracks confirmados con identidad "Desconocido" (%)',
+                   'Valor': 100 * sum(t['ident'] in ('Desconocido', '') for t in conf) / max(len(conf), 1),
+                   'Detalle': 'no superaron el umbral de identificación'}]
+        gt_t = [t for t in tracks if t['gt']]
+        if gt_t:
+            pg, _ = _gaps_por_identidad(tracks, fps_ses, usar_gt=True)
+            conoc = [t for t in gt_t if t['gt'] != DESCONOCIDO]
+            filas += [{'Concepto': 'ID switches reales por fragmentación (Σ tracks por persona − 1)', 'Valor': len(pg), 'Detalle': 'con etiquetas del operador'},
+                      {'Concepto': 'Tracks con identidad final correcta (%)',
+                       'Valor': 100 * sum(t['ident'] == t['gt'] for t in conoc) / max(len(conoc), 1), 'Detalle': f'{len(conoc)} tracks etiquetados'}]
+        else:
+            filas.append({'Concepto': 'ID switches reales por fragmentación', 'Valor': None, 'Detalle': ayuda_gt})
+        filas.append({'Concepto': 'Tracks con 2+ personas distintas (mezcla de identidades)',
+                      'Valor': int(sum(len(g) > 1 for g in por_track_gt.values())) if por_track_gt else None,
+                      'Detalle': 'con etiquetas' if por_track_gt else ayuda_gt})
+    else:       # sesiones antiguas sin tracks.csv: solo lo que se pueda deducir de los eventos
+        filas = [{'Concepto': 'Tracks con Re-ID', 'Valor': len({e['track'] for e in eventos}), 'Detalle': 'sesión sin tracks.csv (versión anterior)'},
+                 {'Concepto': 'Tracks etiquetados', 'Valor': len(por_track_gt), 'Detalle': ''},
+                 {'Concepto': 'Personas etiquetadas', 'Valor': len(por_gt), 'Detalle': ''},
+                 {'Concepto': 'ID switches por fragmentación (Σ tracks por persona − 1)',
+                  'Valor': int(sum(max(len(t) - 1, 0) for t in por_gt.values())), 'Detalle': 'con etiquetas'},
+                 {'Concepto': 'Tracks con 2+ personas distintas', 'Valor': int(sum(len(g) > 1 for g in por_track_gt.values())), 'Detalle': ''}]
+
+    # ---------------- estabilidad temporal por variante (no necesita etiquetas) ----------------
     por_track = defaultdict(list)
     for e in eventos:
         por_track[e['track']].append(e)
     est = []
-    for v in variantes:
-        sw = tr = 0
+    for v, tipo in variantes.items():
+        trans = cambios = c2i = i2c = 0
+        rachas, consist, minutos_v = [], [], 0.0
         for evs in por_track.values():
-            ids = [e['v'][v]['top1'] for e in evs if v in e['v']]
-            tr += max(len(ids) - 1, 0)
-            sw += sum(a != b for a, b in zip(ids, ids[1:]))
-        if tr:
-            est.append({'Variante': v, 'Transiciones': tr, 'Cambios de identidad': sw, 'Cambios (%)': 100 * sw / tr})
-    return filas, est
+            evs = [e for e in evs if v in e['v']]
+            if not evs:
+                continue
+            ids = [e['v'][v]['top1'] for e in evs]
+            trans += len(ids) - 1
+            cambios += sum(a != b for a, b in zip(ids, ids[1:]))
+            run = 1
+            for a, b in zip(ids, ids[1:]):
+                if a == b:
+                    run += 1
+                else:
+                    rachas.append(run)
+                    run = 1
+            rachas.append(run)
+            if len(ids) >= 3:
+                consist.append(Counter(ids).most_common(1)[0][1] / len(ids))
+            minutos_v += max(evs[-1]['t'] - evs[0]['t'], 0.0) / 60.0
+            for a, b, ea in zip(ids, ids[1:], evs):
+                if _conoc(ea):
+                    c2i += int(a == ea['gt'] and b != ea['gt'])
+                    i2c += int(a != ea['gt'] and b == ea['gt'])
+        if trans:
+            est.append({'Variante': v, 'Tipo': tipo, 'Transiciones': trans, 'Cambios de identidad': cambios,
+                        'Cambios (%)': 100 * cambios / trans, 'Estabilidad (%)': 100 - 100 * cambios / trans,
+                        'Racha media (eventos)': float(np.mean(rachas)) if rachas else None,
+                        'Consistencia del track (%)': 100 * float(np.mean(consist)) if consist else None,
+                        'Cambios por minuto': (cambios / minutos_v) if minutos_v > 0 else None,
+                        'Correcto→incorrecto': c2i if por_gt else None, 'Incorrecto→correcto': i2c if por_gt else None})
+    # ---------------- tracks por persona y fragmentos ----------------
+    personas, fragmentos = [], []
+    if tracks:
+        usar_gt = any(t['gt'] and t['gt'] != DESCONOCIDO for t in tracks)
+        pares, grupos = _gaps_por_identidad(tracks, fps_ses, usar_gt)
+        acum = defaultdict(lambda: {'tracks': 0, 'frames': 0, 'dur': 0.0, 'gaps': [], 'rapidas': 0})
+        for (ses, persona), ts in grupos.items():
+            a = acum[persona]
+            a['tracks'] += len(ts)
+            a['frames'] += sum(t['n'] for t in ts)
+            a['dur'] += sum(t['dur'] for t in ts)
+        for pr in pares:
+            a = acum[pr['Persona']]
+            a['gaps'].append(pr['Hueco (s)'])
+            a['rapidas'] += int(0 <= pr['Hueco (s)'] <= VENTANA_REAPARICION_S)
+        for persona, a in sorted(acum.items()):
+            personas.append({'Persona': persona, 'Fuente': 'etiqueta (GT)' if usar_gt else 'identidad del sistema',
+                             'Tracks': a['tracks'], 'Frames vistos': a['frames'], 'Duración total (s)': a['dur'],
+                             'Hueco mediano entre tracks (s)': float(np.median(a['gaps'])) if a['gaps'] else None,
+                             f'Reapariciones ≤{VENTANA_REAPARICION_S:.0f} s': a['rapidas'],
+                             'ID switches estimados (tracks − sesiones)': a['tracks'] - len({s for (s, p) in grupos if p == persona})})
+        fragmentos = sorted(pares, key=lambda r: abs(r['Hueco (s)']))[:30]
+    return filas, est, personas, fragmentos
 
 
 def _mcnemar(a, b):
@@ -314,9 +444,14 @@ def tabla_anova(eventos, variantes_deep):
     if len(com) < 10:
         return []
     M = [np.array([e['v'][v]['top1'] == e['gt'] for e in com], dtype=float) for v in variantes_deep]
-    f = stats.f_oneway(*M)
+    import warnings
+    with warnings.catch_warnings():
+        warnings.simplefilter('ignore')         # sin varianza (todos aciertan) da avisos inofensivos
+        f = stats.f_oneway(*M)
     try:
-        fr = stats.friedmanchisquare(*M)
+        with warnings.catch_warnings():
+            warnings.simplefilter('ignore')
+            fr = stats.friedmanchisquare(*M)
         fr_row = {'Prueba': 'Friedman (medidas repetidas)', 'Estadístico': float(fr.statistic), 'p-value': float(fr.pvalue)}
     except Exception:
         fr_row = {'Prueba': 'Friedman (medidas repetidas)', 'Estadístico': None, 'p-value': None}
@@ -359,6 +494,52 @@ def tabla_deteccion_vivo(sistemas):
 # ----------------------------------------------------------------------------
 # Semáforo
 # ----------------------------------------------------------------------------
+def tabla_deteccion_gt(sistemas):
+    """Detección con cajas anotadas sobre fotogramas del vuelo (ver evaluar_deteccion_vuelo.py)."""
+    filas = []
+    for s in sistemas:
+        d = s.get('deteccion_gt')
+        if d:
+            filas.append({'Sesión': s.get('sesion'), 'Altura (m)': s.get('altura_inicial'), 'Imágenes': d.get('imagenes'),
+                          'Personas anotadas': d.get('gt'), 'TP': d.get('tp'), 'FP': d.get('fp'), 'FN': d.get('fn'),
+                          'Precision': d.get('precision'), 'Recall': d.get('recall'), 'F1': d.get('f1'), 'mAP@0.5': d.get('map50')})
+    return filas
+
+
+R_DIR = os.path.basename(os.path.dirname(os.path.abspath(__file__)))
+AYUDA = {
+    'det_map50': f'Graba el vuelo (GRABAR=True), anota cajas y evalúa: python {R_DIR}/evaluar_deteccion_vuelo.py --sesion <carpeta> --todo',
+    'reid_rank1_propuesto': 'Modo completo + etiquetar personas en vivo (clic + número) o repetir el vuelo grabado con ETIQUETAS_CSV',
+    'reid_rank5': 'Igual que Rank-1: necesita etiquetas',
+    'reid_mrr': 'Igual que Rank-1: necesita etiquetas',
+    'reid_f1': 'Necesita etiquetas (idealmente también personas DESCONOCIDO con la tecla u)',
+    'mejora_vs_deep': 'Necesita etiquetas y una variante distinta al modelo principal (fusión o clásicos): genera la base clásica y las de los demás modelos',
+    'fps': 'Ejecuta una sesión (modo eficiencia o completo)', 'latencia_ms': 'Ejecuta una sesión (modo eficiencia o completo)',
+    'mem_gb': 'Ejecuta una sesión con GPU (nvidia-smi / torch)', 'perdida_pct': 'Ejecuta una sesión (modo eficiencia o completo)',
+    'estabilidad_pct': 'Ejecuta una sesión (modo eficiencia o completo)',
+    'cross_rank1': 'Necesita etiquetas: mide cuánto cae la precisión de webcam (base) a dron (vuelo)',
+    'p_baseline': 'Necesita etiquetas y ≥2 variantes con ≥10 eventos en común (completo + bases de los demás modelos / base clásica)'}
+
+
+def tabla_cobertura(eventos, sistemas, variantes, n_conoc, n_desc, n_tracks):
+    vid = sum(os.path.exists(os.path.join(s.get('_dir', ''), 'video_origen.mp4')) for s in sistemas)
+    det = sum(1 for s in sistemas if s.get('deteccion_gt'))
+    modos = ', '.join(sorted({str(s.get('modo')) for s in sistemas}))
+    return [
+        {'Dato': 'Sesiones analizadas', 'Cantidad': len(sistemas), 'Para qué sirve / cómo obtenerlo': f'modos: {modos}'},
+        {'Dato': 'Eventos de Re-ID', 'Cantidad': len(eventos), 'Para qué sirve / cómo obtenerlo': 'estabilidad temporal y fragmentación (no necesitan etiquetas)'},
+        {'Dato': 'Eventos con persona enrolada etiquetada', 'Cantidad': n_conoc,
+         'Para qué sirve / cómo obtenerlo': 'Top-1, Top-5, MRR, F1, robustez, estadística. Etiqueta en vivo (clic + número) o usa ETIQUETAS_CSV'},
+        {'Dato': 'Eventos DESCONOCIDO (persona no enrolada)', 'Cantidad': n_desc,
+         'Para qué sirve / cómo obtenerlo': 'open-set, FAR y AUROC. Tecla u sobre una persona que no está en la base'},
+        {'Dato': 'Variantes comparadas', 'Cantidad': len(variantes),
+         'Para qué sirve / cómo obtenerlo': 'MODO completo + bases de los 5 modelos + base clásica (preparar_pruebas.py)'},
+        {'Dato': 'Tracks registrados', 'Cantidad': n_tracks, 'Para qué sirve / cómo obtenerlo': 'tracking y fragmentación (tracks.csv)'},
+        {'Dato': 'Sesiones con video grabado', 'Cantidad': vid, 'Para qué sirve / cómo obtenerlo': 'GRABAR=True: permite anotar cajas y repetir el vuelo'},
+        {'Dato': 'Sesiones con detección anotada (cajas)', 'Cantidad': det,
+         'Para qué sirve / cómo obtenerlo': f'mAP/Precision/Recall reales: python {R_DIR}/evaluar_deteccion_vuelo.py --sesion <carpeta> --todo'}]
+
+
 def semaforo(clave):
     filas = []
     for et, claves, sent, mn, fu in CRITERIOS:
@@ -372,7 +553,8 @@ def semaforo(clave):
             est = '🟡 cumple mínimo'
         else:
             est = '🔴 no cumple'
-        filas.append({'Aspecto': et, 'Obtenido': val, 'Mínimo (doc)': f'{sent}{mn}', 'Fuerte (doc)': f'{sent}{fu}', 'Estado': est})
+        filas.append({'Aspecto': et, 'Obtenido': val, 'Mínimo (doc)': f'{sent}{mn}', 'Fuerte (doc)': f'{sent}{fu}', 'Estado': est,
+                      'Cómo obtenerlo': AYUDA.get(claves[0], '') if val is None else ''})
     return filas
 
 
@@ -502,7 +684,17 @@ def analizar_sesiones(dirs, salida=None, verbose=True):
     n_etiq = sum(1 for e in eventos if e['gt'] is not None)
     if verbose:
         print(f'\n🛰️  Sesiones: {len(sistemas)} | eventos de Re-ID: {len(eventos)} | etiquetados: {n_etiq} | variantes: {len(variantes)}')
+    n_conoc = sum(1 for e in eventos if _conoc(e))
+    n_desc = sum(1 for e in eventos if e['gt'] == DESCONOCIDO)
+    n_tracks = sum(len(s.get('_tracks') or []) for s in sistemas)
+    T('cobertura', 'Cobertura de datos de la sesión (qué hay y qué falta para llenar cada métrica)',
+      tabla_cobertura(eventos, sistemas, variantes, n_conoc, n_desc, n_tracks))
+    if verbose and n_etiq == 0:
+        print('\n⚠️  SIN ETIQUETAS: no se pueden calcular Top-1/Top-5/MRR/F1/robustez/estadística.\n'
+              '    Durante el vuelo haz clic sobre una persona y pulsa su número (o u si no está enrolada),\n'
+              '    o repite el vuelo grabado con ETIQUETAS_CSV. La estabilidad y la fragmentación sí se calculan sin etiquetas.')
     T('eficiencia', 'Eficiencia del pipeline con datos reales del dron', tabla_eficiencia(sistemas))
+    T('deteccion_gt', 'Detección con cajas anotadas sobre fotogramas del vuelo (Precision, Recall, F1, mAP@0.5)', tabla_deteccion_gt(sistemas))
     T('deteccion_vivo', '(Proxy en vivo): detecciones por frame y tamaño de las cajas (sin anotaciones de caja no hay P/R/mAP)',
       tabla_deteccion_vivo(sistemas))
     tr = tabla_reid(eventos, variantes, umbrales, primario)
@@ -541,9 +733,11 @@ def analizar_sesiones(dirs, salida=None, verbose=True):
     T('robustez_resolucion', 'Robustez por resolución real del recorte (alto en píxeles)', rr)
     T('imagen_vs_video', 'Imagen única vs voto temporal por track',
       tabla_imagen_video(eventos, [v for v in sel], primario))
-    t1, t2 = tabla_tracking(eventos, variantes, primario)
-    T('tracking_resumen', '(Proxy en vivo): tracking y fragmentación de identidades', t1)
+    t1, t2, t3, t4 = tabla_tracking(eventos, variantes, primario, sistemas)
+    T('tracking_resumen', 'Tracking y fragmentación de identidades (proxy en vivo + etiquetas si existen)', t1)
     T('tracking_estabilidad', 'Estabilidad temporal de la identidad por variante', t2)
+    T('tracking_personas', 'Tracks por persona (fragmentación de identidades)', t3)
+    T('tracking_fragmentos', 'Reapariciones de una misma identidad en tracks distintos (los 30 casos más cercanos)', t4)
     if primario:
         T('estadistica', f'Significancia estadística de cada variante frente a {primario} (mismos eventos)',
           tabla_estadistica(eventos, variantes, primario))
@@ -559,16 +753,20 @@ def analizar_sesiones(dirs, salida=None, verbose=True):
         clave['reid_rank5'] = rp['Top-5 (%)'] if rp['Top-5 (%)'] is not None else (r0 or {}).get('Top-5 (%)')
         clave['reid_mrr'] = 100 * rp['MRR'] if rp['MRR'] is not None else None
         clave['reid_f1'] = rp['F1 óptimo']
-    if rp and r0:
+    if rp and r0 and prop != primario:
         clave['mejora_vs_deep'] = rp['Top-1 (%)'] - r0['Top-1 (%)']
     if r0:
         clave['cross_rank1'] = r0['Top-1 (%)']
-    if prop and primario and prop != primario:
+    alts = [r for r in tr if r['Tipo'] != 'voto' and not r['Variante'].endswith('(principal)')]
+    if alts and primario:                      # p-valor del mejor competidor frente al modelo principal
+        mejor_alt = max(alts, key=lambda r: r['Top-1 (%)'] or 0)['Variante']
         est = tablas.get('estadistica')
-        if est:
-            fila = next((f for f in est[1] if f[f'Variante vs {primario}'] == prop), None)
-            if fila:
-                clave['p_baseline'] = fila['McNemar p']
+        fila = next((f for f in est[1] if f[f'Variante vs {primario}'] == mejor_alt), None) if est else None
+        if fila:
+            clave['p_baseline'] = fila['McNemar p']
+    dg = [s['deteccion_gt']['map50'] for s in sistemas if s.get('deteccion_gt') and s['deteccion_gt'].get('map50') is not None]
+    if dg:
+        clave['det_map50'] = 100 * float(np.mean(dg))
     efi = [s for s in sistemas if s.get('modo') == 'eficiencia'] or sistemas
     med = lambda k: (float(np.median([s[k] for s in efi if s.get(k) is not None])) if any(s.get(k) is not None for s in efi) else None)
     clave['fps'] = med('fps_efectivo')

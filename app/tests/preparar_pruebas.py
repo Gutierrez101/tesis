@@ -4,11 +4,9 @@ PREPARACIÓN OFFLINE (datos reales capturados con la webcam)
 Automatiza, en orden, lo que hay que tener listo ANTES de volar:
   1) bases .pkl de los 5 modelos (OSNet, RepViT M0.9, EfficientFormerV2 S0, FastViT T8, SwiftFormer XS)
   2) base y evaluación de los extractores clásicos HOG / LBP / HSV (individual, parejas, triple)
-  3) (opcional) pruebas offline del documento sobre tus fotos de webcam: arquitecturas, umbral, fusión, etc.
 
 Uso (desde app/):
     python pruebas/preparar_pruebas.py                     # pasos 1 y 2
-    python pruebas/preparar_pruebas.py --con-suite         # + paso 3
     python pruebas/preparar_pruebas.py --solo-clasicos     # solo el paso 2
 """
 import os
@@ -19,7 +17,7 @@ import subprocess
 
 PRUEBAS_DIR = os.path.dirname(os.path.abspath(__file__))
 APP_DIR = os.path.dirname(PRUEBAS_DIR)
-R = os.path.basename(PRUEBAS_DIR)      # nombre real de la carpeta (pruebas / tests)
+R = os.path.basename(PRUEBAS_DIR)
 
 
 def paso(titulo, cmd):

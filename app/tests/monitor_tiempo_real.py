@@ -40,6 +40,7 @@ import time
 import threading
 import subprocess
 import platform
+import unicodedata
 from collections import defaultdict
 from datetime import datetime
 
@@ -130,6 +131,11 @@ class MonitorPruebas:
         self.angulo = str(_cfg('PRUEBAS_ANGULO', 'ANGULO', ANGULOS[0]))
         self.ocl = 0
         self.fps_nominal = float(_cfg('PRUEBAS_FPS_STREAM', 'FPS_STREAM', 30))
+        # ¿la fuente es un archivo de video (repetición de un vuelo grabado)? -> la sesión termina sola al acabar el video
+        self.es_archivo = os.path.exists(str(os.environ.get('RTMP_URL', '')))
+        self._fallos_seguidos = 0
+        self.track_info = {}                      # ciclo de vida de cada track (para tracks.csv)
+        self.base_tiempo = str(_cfg('PRUEBAS_ETIQUETAS_BASE', 'ETIQUETAS_BASE', 'frames')).strip().lower()
         self.crop_cada = int(_cfg('PRUEBAS_CROP_CADA', 'CROP_CADA', 3))
         self.grabar = _bool(_cfg('PRUEBAS_GRABAR', 'GRABAR', False))
         self.mostrar_panel, self.modo_sesion, self.sesion_gt = True, False, None
@@ -153,6 +159,7 @@ class MonitorPruebas:
         self.tipos[primary_name + '+voto'] = 'voto'
         self.umbrales[primary_name] = self.prim.umbral
         self.enrolados = sorted(self.prim.names)
+        self.timeline = self._cargar_timeline(str(_cfg('PRUEBAS_ETIQUETAS_CSV', 'ETIQUETAS_CSV', '') or '').strip())
         self.deeps, self.clasica, self.fusiones = [], None, []
         print(f'\n🔬 MONITOR DE PRUEBAS activado  (modo: {modo})  ->  {self.dir}')
         if self.completo:
@@ -219,6 +226,13 @@ class MonitorPruebas:
         self.intentos += 1
         if not ok:
             self.fallos += 1
+            self._fallos_seguidos += 1
+        else:
+            self._fallos_seguidos = 0
+
+    def terminar(self):
+        """True cuando la fuente es un archivo de video y ya se acabó (así la repetición termina sola)."""
+        return self.es_archivo and self._fallos_seguidos >= 3
 
     def on_reconexion(self):
         self.reconexiones += 1
@@ -251,6 +265,19 @@ class MonitorPruebas:
         vis = [t for t in tracks if t.is_confirmed()]
         self._tracks_vis = [(t.track_id, t.bbox) for t in vis]
         self._n_confirm = len(vis)
+        for t in tracks:
+            info = self.track_info.get(t.track_id)
+            if info is None:
+                info = {'first': frame_count, 'last': frame_count, 'n': 0, 'confirmado': False,
+                        'bbox_ini': tuple(int(v) for v in t.bbox), 'bbox_fin': tuple(int(v) for v in t.bbox),
+                        'ident': 'Desconocido', 'conf': 0.0}
+                self.track_info[t.track_id] = info
+            if t.age == 0:                               # visto (emparejado) en este frame
+                info['n'] += 1
+                info['last'] = frame_count
+                info['bbox_fin'] = tuple(int(v) for v in t.bbox)
+            info['confirmado'] = info['confirmado'] or bool(t.is_confirmed())
+            info['ident'], info['conf'] = t.current_identity, float(t.current_confidence)
 
     def fin_iteracion(self):
         now = time.perf_counter()
@@ -273,22 +300,37 @@ class MonitorPruebas:
         return {'tipo': tipo, 'orden': [names[i] for i in o], 'score': float(s[o[0]]), 'ms': float(ms)}
 
     @_mide
-    def on_reid(self, track, crop_resized, emb, identity, confidence, ms_reid, frame):
+    def on_reid(self, track, crop_resized, emb, identity, confianza, ms_reid, frame):
         self._st['reid_primario'] += ms_reid
-        if not self.completo:
-            return
         tid = track.track_id
         gt = self.labels.get(tid)
-        if gt is None and self.modo_sesion and self.sesion_gt and self._n_confirm == 1:
-            gt = self.sesion_gt
+        if gt is None and self._n_confirm == 1:
+            if self.modo_sesion and self.sesion_gt:
+                gt = self.sesion_gt
+            elif self.timeline:
+                gt = self._gt_timeline(frame)
         ev = {'id': len(self.eventos), 't': time.time() - self.t0, 'frame': frame, 'track': tid, 'gt': gt,
               'altura': self.altura, 'angulo': self.angulo, 'ocl': self.ocl,
               'crop_h': int(track.bbox[3] - track.bbox[1]), 'crop_w': int(track.bbox[2] - track.bbox[0]), 'v': {}}
-        # principal (embedding que ya calculó el sistema: no se repite la inferencia)
+        # principal (embedding que ya calculó el sistema: no se repite la inferencia). Se registra SIEMPRE
+        # (también en modo eficiencia, costo mínimo) para medir estabilidad y fragmentación sin etiquetas.
         s = self.prim.M @ _l2(_np(emb))
         ev['v'][self.primario] = self._res('deep', s, self.prim.names, ms_reid)
         ev['v'][self.primario + '+voto'] = {'tipo': 'voto', 'orden': [track.current_identity],
                                             'score': float(track.current_confidence), 'ms': 0.0}
+        if self.completo:
+            self._evaluar_extras(ev, s, crop_resized, ms_reid)
+        self.eventos.append(ev)
+        self.ev_por_track[tid].append(ev)
+        if gt:
+            self._contar(ev, +1)
+        if self.completo and self.crop_cada and len(self.eventos) % self.crop_cada == 0 and self.n_crops < 1500:
+            os.makedirs(os.path.join(self.dir, 'crops'), exist_ok=True)
+            cv2.imwrite(os.path.join(self.dir, 'crops', f'ev{ev["id"]:06d}_t{tid}.jpg'), crop_resized)
+            self.n_crops += 1
+
+    def _evaluar_extras(self, ev, s, crop_resized, ms_reid):
+        """Resto de modelos profundos, HOG/LBP/HSV (7 combinaciones) y fusiones sobre el MISMO recorte."""
         for d in self.deeps:
             try:
                 t = time.perf_counter()
@@ -296,7 +338,7 @@ class MonitorPruebas:
                 ev['v'][d.nombre] = self._res('deep', d.M @ _l2(e2), d.names, (time.perf_counter() - t) * 1000)
             except Exception:
                 self.errores['monitor_' + d.nombre] += 1
-        sims_c = None
+        sims_c, tms = None, {}
         if self.clasica is not None:
             try:
                 desc, tms = self.ex_clasico.descriptores(crop_resized, medir=True)
@@ -311,14 +353,47 @@ class MonitorPruebas:
             sc = sims_c[TRIPLE][self.f_idx_c]
             for n, a in self.fusiones:
                 ev['v'][n] = self._res('fusion', a * sp + (1 - a) * sc, self.f_names, ms_reid + sum(tms.values()))
-        self.eventos.append(ev)
-        self.ev_por_track[tid].append(ev)
-        if gt:
-            self._contar(ev, +1)
-        if self.crop_cada and len(self.eventos) % self.crop_cada == 0 and self.n_crops < 1500:
-            os.makedirs(os.path.join(self.dir, 'crops'), exist_ok=True)
-            cv2.imwrite(os.path.join(self.dir, 'crops', f'ev{ev["id"]:06d}_t{tid}.jpg'), crop_resized)
-            self.n_crops += 1
+
+    # ------------------------------------------------------------------ etiquetado automático por línea de tiempo
+    @staticmethod
+    def _norm(t):
+        t = unicodedata.normalize('NFKD', str(t)).encode('ascii', 'ignore').decode().lower()
+        return ''.join(ch for ch in t if ch.isalnum())
+
+    def _cargar_timeline(self, ruta):
+        """CSV  desde_s,hasta_s,persona  -> [(desde, hasta, nombre)].  persona = nombre enrolado o DESCONOCIDO.
+        Solo etiqueta cuando hay UN único track confirmado en pantalla (para no mezclar personas)."""
+        if not ruta:
+            return []
+        if not os.path.exists(ruta):
+            print(f'   ⚠️  ETIQUETAS_CSV no existe: {ruta}')
+            return []
+        mapa = {self._norm(n): n for n in self.enrolados}
+        out = []
+        with open(ruta, newline='', encoding='utf-8-sig') as fh:
+            for r in csv.DictReader(fh):
+                try:
+                    d = float(r.get('desde_s') or r.get('inicio') or r.get('desde'))
+                    h = float(r.get('hasta_s') or r.get('fin') or r.get('hasta'))
+                except (TypeError, ValueError):
+                    continue
+                per = (r.get('persona') or r.get('nombre') or '').strip()
+                k = self._norm(per)
+                if k in ('desconocido', 'unknown', 'u', 'noenrolado', 'ajeno'):
+                    out.append((d, h, DESCONOCIDO))
+                elif k in mapa:
+                    out.append((d, h, mapa[k]))
+                else:
+                    print(f'   ⚠️  persona "{per}" del CSV no está enrolada (se ignora). Enroladas: {", ".join(self.enrolados)}')
+        print(f'   🏷️  Etiquetado automático por línea de tiempo: {len(out)} tramos ({ruta}) | base: {self.base_tiempo}')
+        return out
+
+    def _gt_timeline(self, frame):
+        t = (frame / self.fps_nominal) if self.base_tiempo == 'frames' else (time.time() - self.t0)
+        for d, h, n in self.timeline:
+            if d <= t < h:
+                return n
+        return None
 
     # ------------------------------------------------------------------ etiquetado
     def _contar(self, ev, signo):
@@ -532,9 +607,11 @@ class MonitorPruebas:
             'fps_nominal_usado': self.fps_nominal, 'errores': dict(self.errores),
             'estabilidad_pct': 100 * (1 - self.frames_err / max(self.frames, 1)),
             'detecciones': {'personas_por_frame_media': float(np.mean(self.n_personas)) if self.n_personas else 0.0,
+                            'personas_max': int(max(self.n_personas)) if self.n_personas else 0,
                             'frames_sin_personas_pct': 100 * self.sin_personas / max(len(self.n_personas), 1),
                             'alto_caja_px': ({'p10': float(np.percentile(altos, 10)), 'p50': float(np.percentile(altos, 50)),
                                               'p90': float(np.percentile(altos, 90))} if altos is not None else None)},
+            'es_archivo': self.es_archivo, 'etiquetas_timeline': len(self.timeline), 'tracks': len(self.track_info),
             'umbrales': self.umbrales, 'enrolados': self.enrolados, 'variantes': self.tipos, 'n_eventos': len(self.eventos),
             'nota': 'proc_sin_monitor = tiempo de procesamiento por frame sin esperar el stream y sin el costo de las pruebas'}
 
@@ -552,6 +629,16 @@ class MonitorPruebas:
                     w.writerow([ev['id'], f"{ev['t']:.2f}", ev['frame'], ev['track'], gt, ev['altura'], ev['angulo'], ev['ocl'],
                                 ev['crop_h'], ev['crop_w'], v, x['tipo'], orden[0] if orden else '', f"{x['score']:.4f}",
                                 rank, top5, f"{x['ms']:.2f}"])
+        with open(os.path.join(d, 'tracks.csv'), 'w', newline='', encoding='utf-8') as fh:
+            w = csv.writer(fh)
+            w.writerow(['track', 'primer_frame', 'ultimo_frame', 'frames_vistos', 'duracion_s', 'confirmado',
+                        'identidad_final', 'conf_final', 'gt', 'bbox_ini', 'bbox_fin'])
+            for tid, i in sorted(self.track_info.items()):
+                gts = [e['gt'] for e in self.ev_por_track.get(tid, []) if e['gt']]
+                gt = self.labels.get(tid) or (max(set(gts), key=gts.count) if gts else '')
+                w.writerow([tid, i['first'], i['last'], i['n'], f"{(i['last'] - i['first'] + 1) / self.fps_nominal:.2f}",
+                            int(i['confirmado']), i['ident'], f"{i['conf']:.3f}", gt,
+                            '|'.join(map(str, i['bbox_ini'])), '|'.join(map(str, i['bbox_fin']))])
         with open(os.path.join(d, 'etiquetas.csv'), 'w', newline='', encoding='utf-8') as fh:
             w = csv.writer(fh)
             w.writerow(['t_s', 'track', 'gt', 'accion'])
