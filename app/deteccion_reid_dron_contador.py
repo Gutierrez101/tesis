@@ -58,7 +58,7 @@ REID_UPDATE_INTERVAL = 5
 # Comparación en vivo de todos los modelos que tengan base .pkl generada.
 # Actívala con la variable de entorno REID_COMPARE=1 (o pon True aquí).
 # Por defecto está apagada: el sistema funciona exactamente como antes.
-ENABLE_MODEL_COMPARISON = os.environ.get('REID_COMPARE', '0') == '1'
+ENABLE_MODEL_COMPARISON = os.environ.get('REID_COMPARE', '1') == '1'
 
 # Pruebas en tiempo real (pruebas/monitor_tiempo_real.py): off | eficiencia | completo
 # Se configura en pruebas/config_pruebas.py (o con PRUEBAS_MODO). Por defecto 'off': el sistema funciona como antes.
