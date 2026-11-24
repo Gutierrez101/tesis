@@ -136,6 +136,7 @@ class MonitorPruebas:
         self._fallos_seguidos = 0
         self.track_info = {}                      # ciclo de vida de cada track (para tracks.csv)
         self.base_tiempo = str(_cfg('PRUEBAS_ETIQUETAS_BASE', 'ETIQUETAS_BASE', 'frames')).strip().lower()
+        self.ref, self.ref_acum, self.ref_cada, self._frame_actual = None, None, 30, None
         self.crop_cada = int(_cfg('PRUEBAS_CROP_CADA', 'CROP_CADA', 3))
         self.grabar = _bool(_cfg('PRUEBAS_GRABAR', 'GRABAR', False))
         self.mostrar_panel, self.modo_sesion, self.sesion_gt = True, False, None
@@ -160,6 +161,8 @@ class MonitorPruebas:
         self.umbrales[primary_name] = self.prim.umbral
         self.enrolados = sorted(self.prim.names)
         self.timeline = self._cargar_timeline(str(_cfg('PRUEBAS_ETIQUETAS_CSV', 'ETIQUETAS_CSV', '') or '').strip())
+        if _bool(_cfg('PRUEBAS_DET_REF', 'DETECCION_REF_EN_VIVO', False)):
+            self.activar_referencia()
         self.deeps, self.clasica, self.fusiones = [], None, []
         print(f'\n🔬 MONITOR DE PRUEBAS activado  (modo: {modo})  ->  {self.dir}')
         if self.completo:
@@ -240,6 +243,7 @@ class MonitorPruebas:
     @_mide
     def on_frame(self, frame):
         self.frames += 1
+        self._frame_actual = frame
         if self.grabar:
             if self.writer is None:
                 h, w = frame.shape[:2]
@@ -254,12 +258,44 @@ class MonitorPruebas:
         self.errores[que] += 1
         self._err_frame = True
 
-    def on_detecciones(self, detecciones, shape):
+    @_mide
+    def on_detecciones(self, detecciones, shape, confs=None):
         self.n_personas.append(len(detecciones))
         if not detecciones:
             self.sin_personas += 1
         for d in detecciones[:20]:
             self.altos.append(d[3] - d[1])
+        # Verdad terreno AUTOMÁTICA: detector más fuerte sobre el mismo fotograma (cada ref_cada frames)
+        if self.ref is not None and self._frame_actual is not None and self.frames % self.ref_cada == 0:
+            try:
+                self.ref_acum.agregar([tuple(d) for d in detecciones], confs, self.ref.cajas(self._frame_actual))
+            except Exception:
+                self.errores['monitor_referencia'] += 1
+
+    def activar_referencia(self, cada=None):
+        """Carga el detector de referencia (YOLOv8x por defecto). Si falla, las pruebas siguen sin él."""
+        try:
+            from deteccion_referencia import cargar_referencia, AcumuladorDeteccion
+            peso = str(_cfg('PRUEBAS_DET_REF_PESO', 'DETECCION_REF_PESO', 'yolov8x.pt'))
+            self.ref = cargar_referencia(peso, int(_cfg('PRUEBAS_DET_REF_IMGSZ', 'DETECCION_REF_IMGSZ', 1280)))
+            self.ref_cada = int(cada or _cfg('PRUEBAS_DET_REF_CADA', 'DETECCION_REF_CADA', 30))
+            conf_op = 0.4
+            try:
+                import deteccion_reid_dron_contador as D
+                conf_op = float(D.MIN_CONFIDENCE)
+            except Exception:
+                pass
+            self.ref_acum = AcumuladorDeteccion(conf_op, self.ref.nombre)
+            print(f'   🎯 Detector de referencia activo: {self.ref.nombre} (1 de cada {self.ref_cada} frames)')
+        except Exception as e:
+            self.ref = None
+            print(f'   ⚠️  Detector de referencia no disponible ({type(e).__name__}: {e}); la detección se medirá sin él')
+
+    def viz_filtros(self, n, maximo, solo_identificadas, conf_min):
+        """En pruebas se relajan los filtros de visualizaciones para que SIEMPRE se guarden HOG/HSV/LBP del dron."""
+        return (int(_cfg('PRUEBAS_VIZ_CADA_N', 'VIZ_CADA_N_FRAMES', 1)), int(_cfg('PRUEBAS_VIZ_MAX', 'VIZ_MAX_POR_PERSONA', 15)),
+                _bool(_cfg('PRUEBAS_VIZ_SOLO_ID', 'VIZ_SOLO_IDENTIFICADAS', False)),
+                float(_cfg('PRUEBAS_VIZ_CONF', 'VIZ_CONF_MIN', 0.0)))
 
     def on_tracks(self, tracks, frame_count):
         vis = [t for t in tracks if t.is_confirmed()]
@@ -612,6 +648,7 @@ class MonitorPruebas:
                             'alto_caja_px': ({'p10': float(np.percentile(altos, 10)), 'p50': float(np.percentile(altos, 50)),
                                               'p90': float(np.percentile(altos, 90))} if altos is not None else None)},
             'es_archivo': self.es_archivo, 'etiquetas_timeline': len(self.timeline), 'tracks': len(self.track_info),
+            'referencia_deteccion': bool(self.ref_acum is not None and self.ref_acum.frames),
             'umbrales': self.umbrales, 'enrolados': self.enrolados, 'variantes': self.tipos, 'n_eventos': len(self.eventos),
             'nota': 'proc_sin_monitor = tiempo de procesamiento por frame sin esperar el stream y sin el costo de las pruebas'}
 
@@ -629,6 +666,11 @@ class MonitorPruebas:
                     w.writerow([ev['id'], f"{ev['t']:.2f}", ev['frame'], ev['track'], gt, ev['altura'], ev['angulo'], ev['ocl'],
                                 ev['crop_h'], ev['crop_w'], v, x['tipo'], orden[0] if orden else '', f"{x['score']:.4f}",
                                 rank, top5, f"{x['ms']:.2f}"])
+        if self.ref_acum is not None and self.ref_acum.frames:
+            res = self.ref_acum.resumen()
+            if res:
+                with open(os.path.join(d, 'deteccion_ref.json'), 'w', encoding='utf-8') as fh:
+                    json.dump(res, fh, indent=2, ensure_ascii=False)
         with open(os.path.join(d, 'tracks.csv'), 'w', newline='', encoding='utf-8') as fh:
             w = csv.writer(fh)
             w.writerow(['track', 'primer_frame', 'ultimo_frame', 'frames_vistos', 'duracion_s', 'confirmado',
@@ -666,3 +708,24 @@ class MonitorPruebas:
             print(f'⚠️  El análisis automático falló ({type(e).__name__}: {e}). Los datos están guardados; ejecuta:\n'
                   f'    python {R}/analisis_vuelo.py "{self.dir}"')
             traceback.print_exc(limit=3)
+        self._postproceso()
+
+    def _postproceso(self):
+        """Tras el vuelo (modo eficiencia), repite el video grabado SIN ventana con los 5 modelos + HOG/LBP/HSV para
+        comparar las arquitecturas con el MISMO proceso de Re-ID, y mide la detección frente al detector de referencia."""
+        if self.modo == 'completo' or not _bool(_cfg('PRUEBAS_POSTPROCESO', 'POSTPROCESO_COMPARACION', True)):
+            return
+        video = os.path.join(self.dir, 'video_origen.mp4')
+        if not os.path.exists(video):
+            print('ℹ️  Post-proceso omitido: no hay video grabado (pon GRABAR = True en config_pruebas.py).')
+            return
+        print('\n' + '=' * 70 + '\n🔁 POST-PROCESO AUTOMÁTICO: comparación de las 5 arquitecturas sobre el video del vuelo\n' + '=' * 70)
+        env = dict(os.environ, REID_MODEL=self.primario, PRUEBAS_ALTURA_M=str(self.altura_inicial),
+                   PRUEBAS_ANGULO=self.angulo, PRUEBAS_FPS_STREAM=str(self.fps_nominal))
+        cmd = [sys.executable, os.path.join(PRUEBAS_DIR, 'reproducir_vuelo.py'), '--video', video,
+               '--sesion', os.path.basename(self.dir) + '_comparacion']
+        try:
+            subprocess.run(cmd, cwd=APP_DIR, env=env)
+        except Exception as e:
+            print(f'⚠️  No se pudo lanzar el post-proceso ({type(e).__name__}: {e}). Hazlo a mano:\n'
+                  f'    python {R}/lanzar_sesion.py --comparar')

@@ -94,6 +94,10 @@ def cargar_sesion(d):
     if os.path.exists(rd):
         with open(rd, encoding='utf-8') as fh:
             sistema['deteccion_gt'] = json.load(fh)
+    rr = os.path.join(d, 'deteccion_ref.json')
+    if os.path.exists(rr):
+        with open(rr, encoding='utf-8') as fh:
+            sistema['deteccion_ref'] = json.load(fh)
     sistema['_dir'] = d
     return list(eventos.values()), sistema
 
@@ -246,6 +250,34 @@ def tabla_imagen_video(eventos, variantes, primario):
     return filas
 
 
+DET_AUTO = 'automático: consenso de los modelos sobre las personas enroladas en la captura (no es verdad terreno)'
+
+
+def auto_etiquetas(eventos, umbrales, min_ev=3, share=0.6, mezcla_share=0.25):
+    """Etiqueta cada track SIN intervención humana usando las personas enroladas (capturar_persona_mejorado.py):
+    en cada evento vota la identidad de los modelos profundos que superan su umbral; la etiqueta del track es la identidad
+    mayoritaria. 'mezcla' = dos o más identidades con evidencia fuerte dentro del mismo track."""
+    por_track = defaultdict(list)
+    for e in eventos:
+        por_track[e['track']].append(e)
+    out = {}
+    for tk, evs in por_track.items():
+        ids = []
+        for e in evs:
+            votos = [x['top1'] for v, x in e['v'].items() if x['tipo'] == 'deep' and x['score'] >= umbrales.get(v, 0.70)]
+            if votos:
+                ids.append(Counter(votos).most_common(1)[0][0])
+        n = len(ids)
+        if n >= min_ev:
+            c = Counter(ids)
+            mejor, nm = c.most_common(1)[0]
+            out[tk] = {'label': mejor if nm / n >= share else None, 'n': n,
+                       'mezcla': sum(1 for k, v in c.items() if v / n >= mezcla_share and v >= 3) >= 2}
+        else:
+            out[tk] = {'label': None, 'n': n, 'mezcla': False}
+    return out
+
+
 VENTANA_REAPARICION_S = 5.0          # una identidad que reaparece en un track nuevo antes de este tiempo = fragmentación probable
 
 
@@ -274,6 +306,13 @@ def _gaps_por_identidad(tracks, fps_ses, usar_gt):
 def tabla_tracking(eventos, variantes, primario, sistemas=()):
     tracks = [t for s in sistemas for t in (s.get('_tracks') or [])]
     fps_ses = {s.get('sesion'): float(s.get('fps_nominal_usado') or 30.0) for s in sistemas}
+    umbrales_t = {}
+    for s_ in sistemas:
+        umbrales_t.update(s_.get('umbrales', {}))
+    auto = auto_etiquetas(eventos, umbrales_t)
+    n_mezcla_auto = sum(1 for a_ in auto.values() if a_['mezcla'])
+    tracks_auto = [dict(t, gt=(auto.get(t['track']) or {}).get('label')) for t in tracks]
+    n_sw_auto = len(_gaps_por_identidad(tracks_auto, fps_ses, usar_gt=True)[0]) if tracks else 0
     ayuda_gt = 'Etiqueta personas (clic + número) o usa ETIQUETAS_CSV'
     por_gt, por_track_gt = defaultdict(set), defaultdict(set)
     for e in eventos:
@@ -316,10 +355,11 @@ def tabla_tracking(eventos, variantes, primario, sistemas=()):
                       {'Concepto': 'Tracks con identidad final correcta (%)',
                        'Valor': 100 * sum(t['ident'] == t['gt'] for t in conoc) / max(len(conoc), 1), 'Detalle': f'{len(conoc)} tracks etiquetados'}]
         else:
-            filas.append({'Concepto': 'ID switches reales por fragmentación', 'Valor': None, 'Detalle': ayuda_gt})
+            filas.append({'Concepto': 'ID switches por fragmentación (Σ tracks por persona − 1)',
+                          'Valor': n_sw_auto if auto else None, 'Detalle': DET_AUTO if auto else ayuda_gt})
         filas.append({'Concepto': 'Tracks con 2+ personas distintas (mezcla de identidades)',
-                      'Valor': int(sum(len(g) > 1 for g in por_track_gt.values())) if por_track_gt else None,
-                      'Detalle': 'con etiquetas' if por_track_gt else ayuda_gt})
+                      'Valor': int(sum(len(g) > 1 for g in por_track_gt.values())) if por_track_gt else (n_mezcla_auto if auto else None),
+                      'Detalle': 'con etiquetas' if por_track_gt else (DET_AUTO if auto else ayuda_gt)})
     else:       # sesiones antiguas sin tracks.csv: solo lo que se pueda deducir de los eventos
         filas = [{'Concepto': 'Tracks con Re-ID', 'Valor': len({e['track'] for e in eventos}), 'Detalle': 'sesión sin tracks.csv (versión anterior)'},
                  {'Concepto': 'Tracks etiquetados', 'Valor': len(por_track_gt), 'Detalle': ''},
@@ -459,6 +499,60 @@ def tabla_anova(eventos, variantes_deep):
              'Modelos': len(M), 'Eventos': len(com)}, {**fr_row, 'Modelos': len(M), 'Eventos': len(com)}]
 
 
+def tabla_acuerdo(eventos, variantes):
+    """Comparación entre arquitecturas SIN etiquetas: sobre los MISMOS recortes, cuánto coinciden sus identidades."""
+    vs = [v for v, t in variantes.items() if t in ('deep', 'clasico', 'fusion')]
+    if len(vs) < 2:
+        return [], [], None
+    deeps = [v for v in vs if variantes[v] == 'deep']
+    ids = {v: {e['id']: e['v'][v]['top1'] for e in eventos if v in e['v']} for v in vs}
+    cons = {}
+    if len(deeps) >= 2:
+        for e in eventos:
+            vot = [e['v'][v]['top1'] for v in deeps if v in e['v']]
+            if len(vot) >= 2:
+                top = Counter(vot).most_common(2)
+                if len(top) == 1 or top[0][1] > top[1][1]:
+                    cons[e['id']] = top[0][0]
+    prim = next((v for v in vs if variantes[v] == 'deep'), None)
+    filas = []
+    for v in vs:
+        com = [k for k in ids[v] if k in cons]
+        filas.append({'Variante': v, 'Tipo': variantes[v], 'Eventos': len(ids[v]),
+                      'Acuerdo con el consenso de los modelos profundos (%)': (100 * np.mean([ids[v][k] == cons[k] for k in com])) if com else None,
+                      'Eventos con consenso': len(com)})
+    M = np.zeros((len(vs), len(vs)))
+    for i, a in enumerate(vs):
+        for j, b in enumerate(vs):
+            com = [k for k in ids[a] if k in ids[b]]
+            M[i, j] = 100 * np.mean([ids[a][k] == ids[b][k] for k in com]) if com else np.nan
+    pares = [{'Variante': a, **{b: M[i, j] for j, b in enumerate(vs)}} for i, a in enumerate(vs)]
+    return filas, pares, (vs, M)
+
+
+def _fig_acuerdo(salida, datos):
+    try:
+        import matplotlib
+        matplotlib.use('Agg')
+        import matplotlib.pyplot as plt
+    except Exception:
+        return []
+    vs, M = datos
+    fig, ax = plt.subplots(figsize=(max(5, 0.6 * len(vs) + 3), max(4.5, 0.5 * len(vs) + 2.5)))
+    im = ax.imshow(M, vmin=0, vmax=100, cmap='viridis')
+    ax.set_xticks(range(len(vs))); ax.set_yticks(range(len(vs)))
+    ax.set_xticklabels([v[:16] for v in vs], rotation=60, ha='right', fontsize=7)
+    ax.set_yticklabels([v[:16] for v in vs], fontsize=7)
+    for i in range(len(vs)):
+        for j in range(len(vs)):
+            if not np.isnan(M[i, j]):
+                ax.text(j, i, f'{M[i, j]:.0f}', ha='center', va='center', color='w' if M[i, j] < 60 else 'k', fontsize=6)
+    ax.set_title('Acuerdo de identidad entre variantes (%) sobre los mismos recortes', fontsize=9)
+    fig.colorbar(im); fig.tight_layout()
+    fig.savefig(os.path.join(salida, 'fig_acuerdo_modelos.png'), dpi=150); plt.close(fig)
+    return ['fig_acuerdo_modelos.png']
+
+
 def tabla_eficiencia(sistemas):
     filas = []
     for s in sistemas:
@@ -495,20 +589,26 @@ def tabla_deteccion_vivo(sistemas):
 # Semáforo
 # ----------------------------------------------------------------------------
 def tabla_deteccion_gt(sistemas):
-    """Detección con cajas anotadas sobre fotogramas del vuelo (ver evaluar_deteccion_vuelo.py)."""
+    """Detección: anotación humana (evaluar_deteccion_vuelo.py) y/o detector de referencia automático (pseudo-GT)."""
     filas = []
-    for s in sistemas:
-        d = s.get('deteccion_gt')
-        if d:
-            filas.append({'Sesión': s.get('sesion'), 'Altura (m)': s.get('altura_inicial'), 'Imágenes': d.get('imagenes'),
-                          'Personas anotadas': d.get('gt'), 'TP': d.get('tp'), 'FP': d.get('fp'), 'FN': d.get('fn'),
-                          'Precision': d.get('precision'), 'Recall': d.get('recall'), 'F1': d.get('f1'), 'mAP@0.5': d.get('map50')})
+    for s_ in sistemas:
+        for clave, fuente in (('deteccion_gt', 'anotación humana'), ('deteccion_ref', 'detector de referencia (automático)')):
+            d = s_.get(clave)
+            if d:
+                rt = d.get('recall_por_tamano') or {}
+                fila = {'Sesión': s_.get('sesion'), 'Fuente': d.get('fuente_etiquetas') or fuente,
+                        'Altura (m)': s_.get('altura_inicial'), 'Imágenes': d.get('imagenes'),
+                        'Personas de referencia': d.get('gt'), 'TP': d.get('tp'), 'FP': d.get('fp'), 'FN': d.get('fn'),
+                        'Precision': d.get('precision'), 'Recall': d.get('recall'), 'F1': d.get('f1'), 'mAP@0.5': d.get('map50')}
+                for k, v in rt.items():
+                    fila[f'Recall persona {k}'] = v
+                filas.append(fila)
     return filas
 
 
 R_DIR = os.path.basename(os.path.dirname(os.path.abspath(__file__)))
 AYUDA = {
-    'det_map50': f'Graba el vuelo (GRABAR=True), anota cajas y evalúa: python {R_DIR}/evaluar_deteccion_vuelo.py --sesion <carpeta> --todo',
+    'det_map50': f'Automático: POSTPROCESO_COMPARACION=True (o DETECCION_REF_EN_VIVO=True) o python {R_DIR}/evaluar_deteccion_vuelo.py --sesion <carpeta> --todo --auto; con anotación humana: --todo',
     'reid_rank1_propuesto': 'Modo completo + etiquetar personas en vivo (clic + número) o repetir el vuelo grabado con ETIQUETAS_CSV',
     'reid_rank5': 'Igual que Rank-1: necesita etiquetas',
     'reid_mrr': 'Igual que Rank-1: necesita etiquetas',
@@ -536,11 +636,13 @@ def tabla_cobertura(eventos, sistemas, variantes, n_conoc, n_desc, n_tracks):
          'Para qué sirve / cómo obtenerlo': 'MODO completo + bases de los 5 modelos + base clásica (preparar_pruebas.py)'},
         {'Dato': 'Tracks registrados', 'Cantidad': n_tracks, 'Para qué sirve / cómo obtenerlo': 'tracking y fragmentación (tracks.csv)'},
         {'Dato': 'Sesiones con video grabado', 'Cantidad': vid, 'Para qué sirve / cómo obtenerlo': 'GRABAR=True: permite anotar cajas y repetir el vuelo'},
+        {'Dato': 'Sesiones con detección vs detector de referencia (automático)', 'Cantidad': sum(1 for s in sistemas if s.get('deteccion_ref')),
+         'Para qué sirve / cómo obtenerlo': 'Precision/Recall/mAP frente a YOLOv8x: se genera solo con POSTPROCESO_COMPARACION=True'},
         {'Dato': 'Sesiones con detección anotada (cajas)', 'Cantidad': det,
          'Para qué sirve / cómo obtenerlo': f'mAP/Precision/Recall reales: python {R_DIR}/evaluar_deteccion_vuelo.py --sesion <carpeta> --todo'}]
 
 
-def semaforo(clave):
+def semaforo(clave, notas=None):
     filas = []
     for et, claves, sent, mn, fu in CRITERIOS:
         val = next((clave[k] for k in claves if clave.get(k) is not None and not
@@ -554,7 +656,7 @@ def semaforo(clave):
         else:
             est = '🔴 no cumple'
         filas.append({'Aspecto': et, 'Obtenido': val, 'Mínimo (doc)': f'{sent}{mn}', 'Fuerte (doc)': f'{sent}{fu}', 'Estado': est,
-                      'Cómo obtenerlo': AYUDA.get(claves[0], '') if val is None else ''})
+                      'Cómo obtenerlo': AYUDA.get(claves[0], '') if val is None else (notas or {}).get(claves[0], '')})
     return filas
 
 
@@ -736,6 +838,9 @@ def analizar_sesiones(dirs, salida=None, verbose=True):
     t1, t2, t3, t4 = tabla_tracking(eventos, variantes, primario, sistemas)
     T('tracking_resumen', 'Tracking y fragmentación de identidades (proxy en vivo + etiquetas si existen)', t1)
     T('tracking_estabilidad', 'Estabilidad temporal de la identidad por variante', t2)
+    ac1, ac2, ac_dat = tabla_acuerdo(eventos, variantes)
+    T('acuerdo_modelos', 'Comparación entre arquitecturas sin etiquetas: acuerdo con el consenso de los modelos profundos', ac1)
+    T('acuerdo_pares', 'Acuerdo de identidad entre pares de variantes (%) sobre los mismos recortes', ac2)
     T('tracking_personas', 'Tracks por persona (fragmentación de identidades)', t3)
     T('tracking_fragmentos', 'Reapariciones de una misma identidad en tracks distintos (los 30 casos más cercanos)', t4)
     if primario:
@@ -765,8 +870,13 @@ def analizar_sesiones(dirs, salida=None, verbose=True):
         if fila:
             clave['p_baseline'] = fila['McNemar p']
     dg = [s['deteccion_gt']['map50'] for s in sistemas if s.get('deteccion_gt') and s['deteccion_gt'].get('map50') is not None]
+    dr = [s['deteccion_ref']['map50'] for s in sistemas if s.get('deteccion_ref') and s['deteccion_ref'].get('map50') is not None]
+    notas_sem = {}
     if dg:
         clave['det_map50'] = 100 * float(np.mean(dg))
+    elif dr:
+        clave['det_map50'] = 100 * float(np.mean(dr))
+        notas_sem['det_map50'] = 'valor frente al detector de referencia (pseudo-verdad terreno), no anotación humana'
     efi = [s for s in sistemas if s.get('modo') == 'eficiencia'] or sistemas
     med = lambda k: (float(np.median([s[k] for s in efi if s.get(k) is not None])) if any(s.get(k) is not None for s in efi) else None)
     clave['fps'] = med('fps_efectivo')
@@ -779,9 +889,11 @@ def analizar_sesiones(dirs, salida=None, verbose=True):
     clave['perdida_pct'] = max(per) if per else None
     est_ = [s.get('estabilidad_pct') for s in efi if s.get('estabilidad_pct') is not None]
     clave['estabilidad_pct'] = min(est_) if est_ else None
-    T('semaforo', 'Valores obtenidos vs mínimos/fuertes de la sesion', semaforo(clave))
+    T('semaforo', 'Valores obtenidos vs mínimos/fuertes de la sesion', semaforo(clave, notas_sem))
 
     figs = _figuras(salida, eventos, variantes, tr, sistemas, sw_curvas, ra, rr, primario)
+    if ac_dat is not None:
+        figs += _fig_acuerdo(salida, ac_dat)
     notas = ['Métricas con etiquetas puestas en vivo por el operador.',
              'Top-1/Top-5/MRR.',
              'El mAP@0.5 de detección y el IDF1/MOTA reales requieren cajas/tracks anotados: graba el vuelo (PRUEBAS_GRABAR=1) y '

@@ -500,6 +500,18 @@ def main():
     else:
         print(f"\n✨ EXCELENTE: {stats['total_captures']} imágenes capturadas")
 
+    # Visualizaciones HOG / HSV / LBP de las imágenes capturadas (desactivar con VISUALIZAR_CAPTURAS=0)
+    if os.environ.get('VISUALIZAR_CAPTURAS', '1') != '0' and stats['total_captures'] > 0:
+        try:
+            import importlib
+            _app = os.path.dirname(os.path.abspath(__file__))
+            _pkg = next((p for p in ('pruebas', 'tests') if os.path.isfile(os.path.join(_app, p, 'visualizar_capturas.py'))), None)
+            if _pkg:
+                print("\n🎨 Generando visualizaciones HOG / HSV / LBP de las capturas...")
+                importlib.import_module(f'{_pkg}.visualizar_capturas').visualizar_persona(save_path)
+        except Exception as e:
+            print(f"⚠️  No se pudieron generar las visualizaciones: {e}")
+
     print("\n💡 Siguiente paso:")
     print("   python generar_base_personas_mejorado.py")
     print("="*70)

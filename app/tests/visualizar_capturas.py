@@ -15,10 +15,10 @@ Uso (desde app/):
 
 También se ejecuta solo al terminar capturar_persona_mejorado.py (VISUALIZAR_CAPTURAS=0 lo desactiva).
 
-Salida en data/visualizaciones_capturas/<persona>/:
-    original/ hsv/ lbp/ hog/            una imagen por captura seleccionada
-    <persona>_montaje.png               una fila por captura: Original | HSV | LBP | HOG
-    ../resumen_todas_las_personas.png   una fila por persona (solo al procesar a todas)
+Salida en data/visualizaciones/ (la MISMA estructura que usa el sistema en vivo):
+    original/  hsv/  lbp/  hog/            captura_<persona>_<imagen>[_hsv|_lbp|_hog].jpg   (una por captura seleccionada)
+    capturas_montajes/<persona>_montaje.png      una fila por captura: Original | HSV | LBP | HOG
+    capturas_montajes/resumen_todas_las_personas.png   una fila por persona (solo al procesar a todas)
 """
 import os
 import sys
@@ -39,14 +39,13 @@ IMG_EXT = ('.jpg', '.jpeg', '.png', '.bmp')
 def _dirs():
     try:
         import config
-        return config.DATA_DIR, config.PERSONAS_BASE
+        return config.DATA_DIR, config.PERSONAS_BASE, config.VISUALIZATIONS_DIR
     except Exception:
         d = os.path.join(APP_DIR, 'data')
-        return d, os.path.join(d, 'personas_base')
+        return d, os.path.join(d, 'personas_base'), os.path.join(d, 'visualizaciones')
 
 
-DATA_DIR, PERSONAS_BASE = _dirs()
-SALIDA_BASE = os.path.join(DATA_DIR, 'visualizaciones_capturas')
+DATA_DIR, PERSONAS_BASE, SALIDA_BASE = _dirs()
 
 
 def _procesadores():
@@ -110,34 +109,36 @@ def _seleccion(archivos, n):
 
 
 def visualizar_persona(carpeta, salida_base=None, n=4, todas=False):
-    """Genera original/hsv/lbp/hog y un montaje para UNA persona. Devuelve la ruta del montaje (o None)."""
+    """Guarda original/hsv/lbp/hog de las capturas en data/visualizaciones/{original,hsv,lbp,hog}/ y un montaje en
+    data/visualizaciones/capturas_montajes/. Devuelve la ruta del montaje (o None)."""
     persona = os.path.basename(os.path.normpath(carpeta))
     archivos = _lista(carpeta)
     if not archivos:
         print(f'   ⚠️  {persona}: sin imágenes')
         return None
-    elegidas = archivos if todas else _seleccion(archivos, n)
-    out = os.path.join(salida_base or SALIDA_BASE, persona)
-    for sub in ('original', 'hsv', 'lbp', 'hog'):
-        os.makedirs(os.path.join(out, sub), exist_ok=True)
+    base = salida_base or SALIDA_BASE
+    for sub in ('original', 'hsv', 'lbp', 'hog', 'capturas_montajes'):
+        os.makedirs(os.path.join(base, sub), exist_ok=True)
     filas = []
-    for f in elegidas:
+    for f in (archivos if todas else _seleccion(archivos, n)):
         im = cv2.imread(os.path.join(carpeta, f))
         if im is None:
             continue
         v = visualizar_imagen(im)
-        base = os.path.splitext(f)[0]
-        for k in ('original', 'hsv', 'lbp', 'hog'):
-            cv2.imwrite(os.path.join(out, k, f'{base}_{k}.jpg'), v[k], [cv2.IMWRITE_JPEG_QUALITY, 92])
-        filas.append(_fila(v, base))
+        _b = os.path.splitext(f)[0]
+        nombre = f'captura_{persona}_' + (_b[len('captura_'):] if _b.startswith('captura_') else _b)
+        cv2.imwrite(os.path.join(base, 'original', f'{nombre}.jpg'), v['original'], [cv2.IMWRITE_JPEG_QUALITY, 92])
+        for k in ('hsv', 'lbp', 'hog'):
+            cv2.imwrite(os.path.join(base, k, f'{nombre}_{k}.jpg'), v[k], [cv2.IMWRITE_JPEG_QUALITY, 92])
+        filas.append(_fila(v, os.path.splitext(f)[0]))
     if not filas:
         return None
     m = _montaje(filas)
     if m.shape[1] > 1800:
         m = cv2.resize(m, None, fx=1800 / m.shape[1], fy=1800 / m.shape[1], interpolation=cv2.INTER_AREA)
-    ruta = os.path.join(out, f'{persona}_montaje.png')
+    ruta = os.path.join(base, 'capturas_montajes', f'{persona}_montaje.png')
     cv2.imwrite(ruta, m)
-    print(f'   🎨 {persona}: {len(filas)} captura(s) -> {out}\n      montaje: {ruta}')
+    print(f'   🎨 {persona}: {len(filas)} captura(s) -> {base}{os.sep}{{original,hsv,lbp,hog}}\n      montaje: {ruta}')
     return ruta
 
 
@@ -160,7 +161,8 @@ def visualizar_todas(personas_dir=None, salida_base=None, n=4, todas=False):
         m = _montaje(filas)
         if m.shape[1] > 1800:
             m = cv2.resize(m, None, fx=1800 / m.shape[1], fy=1800 / m.shape[1], interpolation=cv2.INTER_AREA)
-        ruta = os.path.join(salida_base or SALIDA_BASE, 'resumen_todas_las_personas.png')
+        os.makedirs(os.path.join(salida_base or SALIDA_BASE, 'capturas_montajes'), exist_ok=True)
+        ruta = os.path.join(salida_base or SALIDA_BASE, 'capturas_montajes', 'resumen_todas_las_personas.png')
         cv2.imwrite(ruta, m)
         print(f'\n🖼️  Resumen de todas las personas: {ruta}')
 
