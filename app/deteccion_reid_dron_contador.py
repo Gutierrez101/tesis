@@ -4,8 +4,9 @@ from ultralytics import YOLO
 import torch
 import pickle
 import numpy as np
-from feature_extractors import build_extractor, get_base_path, get_model_name, get_threshold
-from model_comparison import MultiModelEvaluator
+from feature_extractors import (ALL_MODELS, build_extractor, get_base_path,
+                                get_model_name, get_threshold)
+from model_comparison import MultiModelEvaluator, resolve_temporal_consensus
 from sklearn.metrics.pairwise import cosine_similarity
 import time
 from collections import defaultdict, deque
@@ -54,10 +55,11 @@ MIN_CONFIDENCE = 0.4
 # Parámetros de Re-identificación
 IDENTIFICATION_THRESHOLD = 0.70
 REID_UPDATE_INTERVAL = 5
+REID_ANALYSIS_SECONDS = 2.0
+MIN_REID_MODEL_VOTES = 3
 
-# Comparación en vivo de todos los modelos que tengan base .pkl generada.
-# Actívala con la variable de entorno REID_COMPARE=1 (o pon True aquí).
-# Por defecto está apagada: el sistema funciona exactamente como antes.
+# El panel de comparación es opcional; las cinco arquitecturas se usan siempre
+# para confirmar la identidad.
 ENABLE_MODEL_COMPARISON = os.environ.get('REID_COMPARE', '1') == '1'
 
 # Pruebas en tiempo real (pruebas/monitor_tiempo_real.py): off | eficiencia | completo
@@ -341,6 +343,9 @@ class PersonTrack:
         self.total_frames = 0
         self.last_seen_frame = frame_id
         self.last_reid_frame = frame_id
+        self.reid_analysis_started_at = None
+        self.reid_analysis_samples = []
+        self.reid_analysis_complete = False
         self.color = self._generate_color()
         self.first_detection_time = datetime.now()
 
@@ -458,7 +463,13 @@ def draw_track_info(frame, track, show_confidence_bar=True):
     bbox = track.get_smoothed_bbox()
     x1, y1, x2, y2 = bbox
 
-    if track.current_identity != "Desconocido":
+    if not track.reid_analysis_complete:
+        elapsed = (0.0 if track.reid_analysis_started_at is None else
+                   time.monotonic() - track.reid_analysis_started_at)
+        label = (f"ID:{track.track_id} - Analizando "
+                 f"{min(elapsed, REID_ANALYSIS_SECONDS):.1f}/{REID_ANALYSIS_SECONDS:.1f}s")
+        color = (0, 165, 255)
+    elif track.current_identity != "Desconocido":
         color = (0, 255, 0)
         label = f"{track.current_identity}"
     else:
@@ -644,22 +655,22 @@ def main():
     print(f"✅ Base: {len(base)} persona(s)")
     umbral_principal = get_threshold()   # umbral del modelo principal (config.py)
 
+    # Re-ID obligatorio con las cinco arquitecturas; el panel sí es opcional.
+    comparador = MultiModelEvaluator(
+        primary_name=get_model_name(), primary_base=base,
+        device=device, output_dir=STATS_OUTPUT_DIR, require_all_models=True)
+
     # Monitor de pruebas en tiempo real (opcional, PRUEBAS_MODO=eficiencia|completo)
     monitor = None
     if ENABLE_PRUEBAS:
         import importlib
         MonitorPruebas = importlib.import_module(f'{PRUEBAS_PKG}.monitor_tiempo_real').MonitorPruebas
         monitor = MonitorPruebas(modo=PRUEBAS_MODO, primary_name=get_model_name(), primary_base=base,
-                                 device=device, window='ReID + Contador')
+                                 device=device, window='ReID + Contador',
+                                 external_deep_models=True)
         cv2.setMouseCallback('ReID + Contador', monitor.on_mouse)
 
-    # Comparador de modelos (opcional)
-    comparador = None
-    show_cmp_panel = True
-    if ENABLE_MODEL_COMPARISON and not ENABLE_PRUEBAS:
-        comparador = MultiModelEvaluator(
-            primary_name=get_model_name(), primary_base=base,
-            device=device, output_dir=STATS_OUTPUT_DIR)
+    show_cmp_panel = ENABLE_MODEL_COMPARISON
 
     # Inicializar contador
     counter = PeopleCounter()
@@ -688,7 +699,7 @@ def main():
     print("\n🎥 Conectando a stream RTMP...")
     rtmp_url = os.getenv(
         "RTMP_URL",
-        "rtmp://192.168.100.45:1935/live/stream"
+        "rtmp://192.168.137.233:1935/live/stream"
     )
 
     def connect_to_stream(url, max_retries=STREAM_RECONNECT_ATTEMPTS):
@@ -752,6 +763,8 @@ def main():
     print("\n" + "="*70)
     print("🚀 INICIANDO DETECCIÓN Y CONTEO")
     print("="*70)
+    print(f"🔎 Análisis inicial: {REID_ANALYSIS_SECONDS:.0f}s; consenso de "
+          f"{MIN_REID_MODEL_VOTES}/{len(ALL_MODELS)} arquitecturas")
     print("⌨️  Controles:")
     print("   - 'q': Salir (guarda estadísticas)")
     print("   - 's': Guardar estadísticas ahora")
@@ -896,6 +909,7 @@ def main():
                 )
 
                 if should_reid:
+                    track.last_reid_frame = frame_count
                     crop_idx = None
                     for j, (det_idx, track_idx) in enumerate(matched):
                         if track_idx == i:
@@ -909,39 +923,63 @@ def main():
                                 crop_resized = cv2.resize(crop, (128, 256))
                                 t_reid = time.perf_counter()
                                 emb = extractor(crop_resized)[0]
-                                identity, confidence = identificar(emb, base, threshold=umbral_principal)
+                                primary_identity, primary_confidence = identificar(
+                                    emb, base, threshold=umbral_principal)
                                 ms_reid = (time.perf_counter() - t_reid) * 1000
-                                track.update_identity(identity, confidence, frame_count)
 
-                                # Mismo recorte a los demás modelos (solo si está activado)
-                                if comparador:
-                                    comparador.evaluate(track.track_id, crop_resized, frame_count,
-                                                        (identity, confidence, ms_reid))
+                                model_results, model_rankings = comparador.evaluate(
+                                    track.track_id, crop_resized, frame_count,
+                                    (primary_identity, primary_confidence, ms_reid),
+                                    primary_embedding=emb)
+
+                                if not track.reid_analysis_complete:
+                                    if track.reid_analysis_started_at is None:
+                                        track.reid_analysis_started_at = time.monotonic()
+                                    track.reid_analysis_samples.append(model_results)
+                                    elapsed = time.monotonic() - track.reid_analysis_started_at
+                                    if elapsed >= REID_ANALYSIS_SECONDS:
+                                        identity, confidence, votes = resolve_temporal_consensus(
+                                            track.reid_analysis_samples,
+                                            min_votes=MIN_REID_MODEL_VOTES)
+                                        track.reid_analysis_complete = True
+                                        track.reid_analysis_samples.clear()
+                                        logger.info(
+                                            "Análisis inicial track %s: %s (votos: %s)",
+                                            track.track_id, identity, votes)
+                                        track.update_identity(identity, confidence, frame_count)
+                                    else:
+                                        identity, confidence = "Desconocido", 0.0
+                                else:
+                                    identity, confidence, _ = resolve_temporal_consensus(
+                                        [model_results], min_votes=MIN_REID_MODEL_VOTES)
+                                    track.update_identity(identity, confidence, frame_count)
 
                                 # Pruebas en tiempo real (solo si PRUEBAS_MODO está activo)
                                 if monitor:
-                                    monitor.on_reid(track, crop_resized, emb, identity, confidence, ms_reid, frame_count)
+                                    monitor.on_reid(
+                                        track, crop_resized, emb, primary_identity,
+                                        primary_confidence, ms_reid, frame_count,
+                                        deep_rankings=model_rankings)
 
-                                # Log detección
-                                counter.log_detection(
-                                    track.track_id,
-                                    identity,
-                                    confidence,
-                                    datetime.now()
-                                )
-
-                                # Enviar a sistema de visualizaciones
-                                if viz_handler:
-                                    viz_handler.add_to_queue(
-                                        crop=crop,
-                                        identity=identity,
-                                        confidence=confidence,
-                                        track_id=track.track_id,
-                                        frame_count=frame_count
+                                if track.reid_analysis_complete:
+                                    counter.log_detection(
+                                        track.track_id,
+                                        identity,
+                                        confidence,
+                                        datetime.now()
                                     )
+                                    if viz_handler:
+                                        viz_handler.add_to_queue(
+                                            crop=crop,
+                                            identity=identity,
+                                            confidence=confidence,
+                                            track_id=track.track_id,
+                                            frame_count=frame_count
+                                        )
 
                             except Exception as e:
                                 # Error en Re-ID, continuar sin crash
+                                logger.exception("Error en Re-ID para track %s", track.track_id)
                                 if monitor:
                                     monitor.on_error('reid')
 

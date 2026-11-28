@@ -36,6 +36,44 @@ def _l2(x):
     return x / np.clip(n, 1e-12, None)
 
 
+def resolve_temporal_consensus(samples, model_names=None, min_votes=3):
+    """Exige estabilidad temporal por modelo y mayoría entre arquitecturas."""
+    model_names = tuple(model_names or ALL_MODELS)
+    model_votes = {}
+    model_scores = {}
+
+    for name in model_names:
+        results = [sample[name] for sample in samples if name in sample]
+        counts = Counter(result[0] for result in results)
+        counts.pop("Desconocido", None)
+        if not counts:
+            model_votes[name] = "Desconocido"
+            continue
+
+        identity, count = counts.most_common(1)[0]
+        if count * 2 <= len(results):
+            model_votes[name] = "Desconocido"
+            continue
+
+        model_votes[name] = identity
+        scores = [float(score) for result_identity, score, _ in results
+                  if result_identity == identity]
+        model_scores[name] = float(np.mean(scores)) if scores else 0.0
+
+    counts = Counter(identity for identity in model_votes.values()
+                     if identity != "Desconocido")
+    if not counts:
+        return "Desconocido", 0.0, model_votes
+
+    identity, votes = counts.most_common(1)[0]
+    if votes < min_votes or sum(vote == votes for vote in counts.values()) > 1:
+        return "Desconocido", 0.0, model_votes
+
+    confidence = float(np.mean([model_scores[name] for name in model_names
+                                if model_votes[name] == identity]))
+    return identity, confidence, model_votes
+
+
 class ModelStats:
     def __init__(self):
         self.n = 0                  # inferencias (eventos de Re-ID)
@@ -91,15 +129,18 @@ class _Slot:
 
     def identify(self, emb):
         sims = self.matrix @ _l2(emb)
-        i = int(np.argmax(sims))
+        order = np.argsort(-sims)
+        i = int(order[0])
         score = float(sims[i])
-        return (self.names[i] if score >= self.threshold else "Desconocido"), score
+        ranked_names = [self.names[index] for index in order]
+        return (self.names[i] if score >= self.threshold else "Desconocido"), score, ranked_names
 
 
 class MultiModelEvaluator:
     def __init__(self, primary_name, primary_base, device='cpu',
-                 models=None, output_dir='.'):
+                 models=None, output_dir='.', require_all_models=False):
         self.primary = primary_name
+        self.require_all_models = require_all_models
         self.output_dir = output_dir
         os.makedirs(output_dir, exist_ok=True)
         self.slots = {}
@@ -131,6 +172,13 @@ class MultiModelEvaluator:
             except Exception as e:
                 print(f"   ❌ {name}: {type(e).__name__}: {e} (se omite)")
 
+        missing_models = [name for name in ALL_MODELS if name not in self.slots]
+        if self.require_all_models and missing_models:
+            raise RuntimeError(
+                "No se pudieron cargar las cinco arquitecturas requeridas; "
+                f"faltan: {', '.join(missing_models)}. Verifica sus bases y modelos."
+            )
+
         if len(self.slots) < 2:
             print("   ⚠️  Solo hay 1 modelo disponible; genera más bases con "
                   "generar_todas_las_bases.py")
@@ -140,20 +188,35 @@ class MultiModelEvaluator:
         return len(self.slots)
 
     # ------------------------------------------------------------------
-    def evaluate(self, track_id, crop_resized, frame_count, primary_result):
+    def evaluate(self, track_id, crop_resized, frame_count, primary_result,
+                 primary_embedding=None):
         """primary_result = (identidad, confianza, ms) del modelo principal,
         que main() ya calculó (no se repite su inferencia)."""
         results = {self.primary: tuple(primary_result)}
+        rankings = {}
+        if primary_embedding is not None:
+            primary_slot = self.slots[self.primary]
+            sims = primary_slot.matrix @ _l2(_to_numpy(primary_embedding))
+            order = np.argsort(-sims)
+            rankings[self.primary] = (
+                [primary_slot.names[index] for index in order],
+                float(sims[order[0]]),
+                float(primary_result[2]),
+            )
         for name, slot in self.slots.items():
             if name == self.primary:
                 continue
             try:
                 t0 = time.perf_counter()
                 emb = _to_numpy(slot.extractor(crop_resized)[0])   # .cpu() sincroniza la GPU
-                ident, conf = slot.identify(emb)
-                results[name] = (ident, conf, (time.perf_counter() - t0) * 1000)
+                ident, conf, ranked_names = slot.identify(emb)
+                elapsed_ms = (time.perf_counter() - t0) * 1000
+                results[name] = (ident, conf, elapsed_ms)
+                rankings[name] = (ranked_names, conf, elapsed_ms)
             except Exception:
                 slot.stats.errors += 1
+                if self.require_all_models:
+                    raise
 
         # Consenso = identidad más votada (solo con >= 3 modelos y sin empate)
         consensus = None
@@ -170,7 +233,7 @@ class MultiModelEvaluator:
             self.slots[name].stats.record(track_id, ident, conf, ms, same_p, same_c)
             self.events.append((ts, frame_count, track_id, name, ident,
                                 round(float(conf), 4), round(float(ms), 2)))
-        return results
+        return results, rankings
 
     # ------------------------------------------------------------------
     def summary(self):

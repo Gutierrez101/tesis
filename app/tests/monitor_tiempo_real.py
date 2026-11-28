@@ -119,7 +119,8 @@ class _Modelo:
 
 
 class MonitorPruebas:
-    def __init__(self, modo, primary_name, primary_base, device='cpu', window='ReID + Contador', sesion=None):
+    def __init__(self, modo, primary_name, primary_base, device='cpu', window='ReID + Contador',
+                 sesion=None, external_deep_models=False):
         from config import DATA_DIR
         self.modo, self.completo = modo, modo == 'completo'
         self.primario, self.device, self.window = primary_name, device, window
@@ -169,6 +170,10 @@ class MonitorPruebas:
             import pickle
             for m in ALL_MODELS:
                 if m == primary_name:
+                    continue
+                if external_deep_models:
+                    self.tipos[m] = 'deep'
+                    self.umbrales[m] = get_threshold(m)
                     continue
                 p = get_base_path(m)
                 if not os.path.exists(p):
@@ -336,7 +341,8 @@ class MonitorPruebas:
         return {'tipo': tipo, 'orden': [names[i] for i in o], 'score': float(s[o[0]]), 'ms': float(ms)}
 
     @_mide
-    def on_reid(self, track, crop_resized, emb, identity, confianza, ms_reid, frame):
+    def on_reid(self, track, crop_resized, emb, identity, confianza, ms_reid, frame,
+                deep_rankings=None):
         self._st['reid_primario'] += ms_reid
         tid = track.track_id
         gt = self.labels.get(tid)
@@ -355,7 +361,7 @@ class MonitorPruebas:
         ev['v'][self.primario + '+voto'] = {'tipo': 'voto', 'orden': [track.current_identity],
                                             'score': float(track.current_confidence), 'ms': 0.0}
         if self.completo:
-            self._evaluar_extras(ev, s, crop_resized, ms_reid)
+            self._evaluar_extras(ev, s, crop_resized, ms_reid, deep_rankings)
         self.eventos.append(ev)
         self.ev_por_track[tid].append(ev)
         if gt:
@@ -365,15 +371,24 @@ class MonitorPruebas:
             cv2.imwrite(os.path.join(self.dir, 'crops', f'ev{ev["id"]:06d}_t{tid}.jpg'), crop_resized)
             self.n_crops += 1
 
-    def _evaluar_extras(self, ev, s, crop_resized, ms_reid):
+    def _evaluar_extras(self, ev, s, crop_resized, ms_reid, deep_rankings=None):
         """Resto de modelos profundos, HOG/LBP/HSV (7 combinaciones) y fusiones sobre el MISMO recorte."""
-        for d in self.deeps:
-            try:
-                t = time.perf_counter()
-                e2 = _np(d.ext(crop_resized)[0])
-                ev['v'][d.nombre] = self._res('deep', d.M @ _l2(e2), d.names, (time.perf_counter() - t) * 1000)
-            except Exception:
-                self.errores['monitor_' + d.nombre] += 1
+        if deep_rankings is None:
+            for d in self.deeps:
+                try:
+                    t = time.perf_counter()
+                    e2 = _np(d.ext(crop_resized)[0])
+                    ev['v'][d.nombre] = self._res(
+                        'deep', d.M @ _l2(e2), d.names, (time.perf_counter() - t) * 1000)
+                except Exception:
+                    self.errores['monitor_' + d.nombre] += 1
+        else:
+            for name, (order, score, elapsed_ms) in deep_rankings.items():
+                if name != self.primario:
+                    ev['v'][name] = {
+                        'tipo': 'deep', 'orden': order, 'score': float(score),
+                        'ms': float(elapsed_ms),
+                    }
         sims_c, tms = None, {}
         if self.clasica is not None:
             try:

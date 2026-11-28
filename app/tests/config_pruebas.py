@@ -8,8 +8,8 @@ Edita este archivo y ejecuta simplemente:
 y el monitor de pruebas se activa solo. Las variables de entorno (PRUEBAS_MODO, PRUEBAS_SESION,
 PRUEBAS_ALTURA_M, ...) si existen, tienen prioridad sobre este archivo.
 """
-MODO = 'eficiencia'              # 'off' = sistema normal | 'eficiencia' = solo tiempos/memoria | 'completo' = todo + etiquetado en vivo
-SESION = 'vuelo_eficiencia'          # nombre de la carpeta de resultados (cámbialo en cada vuelo)
+MODO = 'completo'              # 'off' = sistema normal | 'eficiencia' = solo tiempos/memoria | 'completo' = todo + etiquetado en vivo
+SESION = 'vuelo_prueba1'          # nombre de la carpeta de resultados (cámbialo en cada vuelo)
 ALTURA_M = 5.0           # altura inicial del dron en metros (en vivo: teclas + y -)
 ANGULO = 'frontal-oblicuo'  # frontal-oblicuo | lateral-oblicuo | posterior-oblicuo | cenital_parcial | cenital_extremo (tecla a)
 GRABAR = True            # True = graba el video original del vuelo (para pruebas offline de detección/MOT)
